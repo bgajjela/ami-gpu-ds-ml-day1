@@ -39,7 +39,7 @@ jobs:
           file /usr/bin/qemu-aarch64-static
 
       - name: Install Nix with aarch64 cross-compile support
-        uses: cachix/install-nix-action@v30
+        uses: cachix/install-nix-action@v31
         with:
           nix_path: nixpkgs=channel:nixos-unstable
           extra_nix_config: |
