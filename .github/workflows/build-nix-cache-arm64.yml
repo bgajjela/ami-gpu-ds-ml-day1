@@ -55,7 +55,7 @@ jobs:
           echo "✅ aarch64 registered with Nix"
 
       - name: Setup Cachix (binary cache)
-        uses: cachix/cachix-action@v15
+        uses: cachix/cachix-action@v17
         with:
           name: cpu-ds-ml
           authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
