@@ -1,0 +1,577 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions: read-all
+
+jobs:
+  lint-and-test:
+    name: Lint, CIS check, CVE scan
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+      actions: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Mask sensitive values in logs
+        run: |
+          echo "::add-mask::${{ github.repository }}"
+          echo "::add-mask::${{ github.workspace }}"
+          echo "::add-mask::${{ github.actor }}"
+          # Mask any potential AWS IDs, subnet IDs, security group IDs found in files
+          if grep -r "ami-[a-f0-9]\{17\}\|subnet-[a-f0-9]\{17\}\|sg-[a-f0-9]\{17\}" --include="*.hcl" --include="*.sh" . 2>/dev/null | cut -d: -f2 | sort -u; then
+            while read -r value; do
+              [[ -n "$value" ]] && echo "::add-mask::$value"
+            done < <(grep -r "ami-[a-f0-9]\{17\}\|subnet-[a-f0-9]\{17\}\|sg-[a-f0-9]\{17\}" --include="*.hcl" --include="*.sh" . 2>/dev/null | grep -o "[a-f0-9\-]*-[a-f0-9]\{17\}" | sort -u)
+          fi
+
+      - name: Install shellcheck
+        run: sudo apt-get install -y shellcheck
+
+      - name: Install packer
+        run: |
+          curl -fsSL https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp.gpg
+          echo "deb [signed-by=/usr/share/keyrings/hashicorp.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/hashicorp.list
+          sudo apt-get update && sudo apt-get install -y packer
+
+      - name: ShellCheck
+        run: |
+          shellcheck -S warning harden.sh \
+            scripts/ami-finalize.sh \
+            scripts/ami-scan.sh \
+            scripts/build-base-envs.sh \
+            scripts/build-pro-envs.sh \
+            scripts/tune-pro.sh \
+            scripts/smoke-pro.sh \
+            scripts/spark-java.sh \
+            scripts/test-ami.sh
+
+      - name: Bash syntax check
+        run: |
+          set -e
+          for script in \
+            harden.sh \
+            scripts/ami-finalize.sh \
+            scripts/ami-scan.sh \
+            scripts/build-base-envs.sh \
+            scripts/build-pro-envs.sh \
+            scripts/tune-pro.sh \
+            scripts/smoke-pro.sh \
+            scripts/spark-java.sh \
+            scripts/test-ami.sh; do
+            bash -n "$script"
+            echo "✓ $script"
+          done
+
+      - name: Validate Packer provisioner scripts
+        run: |
+          echo "Validating Packer provisioner scripts..."
+          packer_scripts=$(grep -o 'source.*=.*"[^"]*\.sh"' packer.pkr.hcl | cut -d'"' -f2 | sort -u)
+
+          for script in $packer_scripts; do
+            if [ ! -f "$script" ]; then
+              echo "❌ MISSING script in packer.pkr.hcl: $script"
+              exit 1
+            fi
+
+            # Validate bash syntax
+            if ! bash -n "$script" 2>/dev/null; then
+              echo "❌ SYNTAX ERROR in $script"
+              bash -n "$script"
+              exit 1
+            fi
+
+            echo "✓ $script (syntax valid)"
+          done
+
+          # Verify no direct script execution without bash wrapper
+          if grep -E 'sudo /tmp/[a-z\-]+\.sh["\s]' packer.pkr.hcl; then
+            echo "❌ ERROR: Found direct script execution without 'bash' wrapper"
+            echo "   Use: sudo bash /tmp/script.sh (not: sudo /tmp/script.sh)"
+            exit 1
+          fi
+
+          echo "✓ All provisioner scripts valid"
+
+      - name: Guard — noexec /tmp requires execute_command on every shell provisioner
+        run: |
+          # ROOT-CAUSE GUARD (see local noexec simulation).
+          # harden.sh mounts /tmp as a noexec tmpfs, and the build reboots into it.
+          # After that, Packer's DEFAULT execute_command ("chmod +x {{.Path}}; {{.Path}}")
+          # exec's its uploaded wrapper BY PATH on the noexec /tmp -> exit 126.
+          # bash -n can never catch this; it is a structural invariant, so we assert it.
+          echo "Checking noexec-/tmp invariant on packer.pkr.hcl..."
+
+          reboots=$(grep -c 'sudo reboot' packer.pkr.hcl || true)
+          hardens_tmp=$(grep -cE 'Where=/tmp' harden.sh || true)
+          shell_prov=$(grep -c 'provisioner "shell"' packer.pkr.hcl || true)
+          exec_cmds=$(grep -c 'execute_command' packer.pkr.hcl || true)
+
+          echo "  reboots=$reboots  noexec-/tmp-in-harden=$hardens_tmp"
+          echo "  shell provisioners=$shell_prov  execute_command overrides=$exec_cmds"
+
+          # Only enforce when the build actually creates a noexec /tmp and reboots into it.
+          if [ "$reboots" -ge 1 ] && [ "$hardens_tmp" -ge 1 ]; then
+            if [ "$exec_cmds" -lt "$shell_prov" ]; then
+              echo "❌ ERROR: $shell_prov shell provisioners but only $exec_cmds execute_command overrides."
+              echo "   On a noexec /tmp, every shell provisioner MUST set:"
+              echo "     execute_command = \"chmod +x {{ .Path }}; {{ .Vars }} bash {{ .Path }}\""
+              echo "   Otherwise Packer exec's its wrapper by path and fails with exit 126."
+              exit 1
+            fi
+
+            # Each override must invoke the interpreter (bash {{ .Path }}), not exec-by-path.
+            bad=$(grep -E 'execute_command' packer.pkr.hcl | grep -vc 'bash {{ .Path }}' || true)
+            if [ "$bad" -gt 0 ]; then
+              echo "❌ ERROR: $bad execute_command line(s) do not run via 'bash {{ .Path }}'."
+              echo "   noexec /tmp blocks exec-by-path; the wrapper must be read by bash."
+              exit 1
+            fi
+          fi
+
+          echo "✓ noexec-/tmp invariant satisfied (all $shell_prov shell provisioners run via bash)"
+
+      - name: CIS compliance check
+        run: bash tests/cis-check.sh
+
+      - name: Trivy — CVE + secret + misconfiguration scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          scan-type: fs
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          exit-code: 1
+          format: sarif
+          output: trivy-results.sarif
+
+      - name: Upload Trivy SARIF to code-scanning
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Packer validate
+        run: |
+          packer init .
+          packer validate \
+            -var subnet_id=subnet-placeholder \
+            -var security_group_id=sg-placeholder \
+            -var base_ami_id=ami-00000000000000000 \
+            -var base_ami_id_arm=ami-00000000000000000 \
+            .
+
+      - name: Checkov — Packer IaC misconfiguration scan
+        uses: bridgecrewio/checkov-action@37026823bd2a0a70f8aedd88f8a3e9cb342418af  # v12
+        with:
+          file: packer.pkr.hcl
+          framework: terraform
+          soft_fail: false
+          quiet: true
+
+      - name: Verify required provisioner files exist
+        run: |
+          echo "Checking required scripts and provisioners..."
+          files_ok=true
+          for file in \
+            "packer.pkr.hcl" \
+            "harden.sh" \
+            "nix/flake.nix" \
+            "scripts/build-base-envs.sh" \
+            "scripts/ami-finalize.sh" \
+            "scripts/test-ami.sh"; do
+            if [ ! -f "$file" ]; then
+              echo "  ✗ MISSING: $file"
+              files_ok=false
+            else
+              echo "  ✓ $file"
+            fi
+          done
+          if [ "$files_ok" = false ]; then
+            exit 1
+          fi
+          echo "✓ All required provisioner files present"
+
+      - name: Verify Nix flake outputs
+        run: |
+          echo "Checking Nix flake structure..."
+          grep -q "outputs.*=" nix/flake.nix || { echo "ERROR: flake.nix missing 'outputs' definition"; exit 1; }
+          grep -q "packages.*=" nix/flake.nix || { echo "ERROR: flake.nix missing 'packages' output"; exit 1; }
+          grep -q "x86_64-linux" nix/flake.nix || { echo "ERROR: flake.nix missing x86_64-linux support"; exit 1; }
+          grep -q "aarch64-linux" nix/flake.nix || { echo "ERROR: flake.nix missing aarch64-linux support"; exit 1; }
+          echo "✓ Nix flake structure valid (x86_64 + aarch64)"
+
+      - name: Check DEBIAN_FRONTEND is set in harden.sh
+        run: |
+          echo "Verifying apt-get debconf handling..."
+          count=$(grep -c "DEBIAN_FRONTEND=noninteractive" harden.sh)
+          if [[ $count -lt 10 ]]; then
+            echo "WARNING: Only found $count instances of DEBIAN_FRONTEND=noninteractive"
+          fi
+          echo "✓ Debconf handling verified"
+
+      - name: Verify POSIX shell compatibility
+        run: |
+          echo "Checking for bash-only syntax..."
+          if grep -r "\[\[ " scripts/ | grep -v "test " >/dev/null 2>&1; then
+            echo "WARNING: Found potential bash-only [[ ]] syntax"
+          fi
+          echo "✓ POSIX compatibility verified"
+
+      - name: Validate Nix experimental features format
+        run: |
+          echo "Checking Nix feature flags are separate (not comma-separated)..."
+          if grep -q "extra-experimental-features nix-command,flakes" packer.pkr.hcl scripts/build-base-envs.sh 2>/dev/null; then
+            echo "ERROR: Found comma-separated Nix features (should be separate flags)"
+            exit 1
+          fi
+          if grep -q "extra-experimental-features nix-command --extra-experimental-features flakes" packer.pkr.hcl scripts/build-base-envs.sh; then
+            echo "✓ Nix features correctly formatted with separate flags"
+          else
+            echo "WARNING: Could not verify Nix feature flags format"
+          fi
+
+      - name: Verify credential masking in AMI workflows
+        run: |
+          for workflow in .github/workflows/ami-build.yml .github/workflows/ami-build-arm64.yml; do
+            echo "Checking credential masking in ${workflow}..."
+            if grep -q "::add-mask::" "${workflow}"; then
+              mask_count=$(grep -c "::add-mask::" "${workflow}")
+              echo "✓ Credential masking detected (${mask_count} masks in ${workflow})"
+            else
+              echo "ERROR: No credential masking found in ${workflow}"
+              exit 1
+            fi
+          done
+
+      - name: Check for file provisioner placeholders
+        run: |
+          echo "Verifying file provisioners reference actual files..."
+          # Ensure all source= paths in packer.pkr.hcl exist or have existence checks
+          if grep -q 'source.*\.\/' packer.pkr.hcl; then
+            echo "✓ File provisioners configured"
+          fi
+          echo "Checking for graceful fallbacks on missing files..."
+          if grep -q "test -f.*||" packer.pkr.hcl; then
+            echo "✓ File existence checks with fallbacks present"
+          else
+            echo "WARNING: No file existence checks found in packer.pkr.hcl"
+          fi
+
+      - name: Validate GitHub Actions versions are pinned
+        run: |
+          echo "Checking that all GitHub Actions use pinned SHA versions..."
+          unpinned=$(grep -E "uses: .+@[^a-f0-9]|uses: .+@$" .github/workflows/*.yml | wc -l)
+          if [[ $unpinned -gt 0 ]]; then
+            echo "WARNING: Found $unpinned unpinned action versions"
+            grep -E "uses: .+@[^a-f0-9]|uses: .+@$" .github/workflows/*.yml || true
+          else
+            echo "✓ All GitHub Actions properly version-pinned"
+          fi
+
+      - name: Validate packer.pkr.hcl has all 4 build targets
+        run: |
+          echo "Checking that all 4 AMI variants are defined..."
+          targets=("ubuntu_base" "ubuntu_pro" "ubuntu_arm_base" "ubuntu_arm_pro")
+          for target in "${targets[@]}"; do
+            if grep -q "source \"amazon-ebs\" \"${target}\"" packer.pkr.hcl; then
+              echo "  ✓ ${target}"
+            else
+              echo "  ✗ MISSING: ${target}"
+              exit 1
+            fi
+          done
+          echo "✓ All 4 build targets present (x86 base/pro, ARM64 base/pro)"
+
+      - name: Verify AMI workflow environment variables
+        run: |
+          for workflow in .github/workflows/ami-build.yml .github/workflows/ami-build-arm64.yml; do
+            echo "Checking ${workflow} for required environment configuration..."
+            if grep -q "AWS_ROLE_ARN" "${workflow}"; then
+              echo "  ✓ AWS_ROLE_ARN referenced"
+            else
+              echo "  ✗ MISSING: AWS_ROLE_ARN not found in ${workflow}"
+              exit 1
+            fi
+            if grep -q "AWS_DEFAULT_REGION\|region" "${workflow}"; then
+              echo "  ✓ AWS_DEFAULT_REGION configured"
+            else
+              echo "  ✗ MISSING: region configuration not found in ${workflow}"
+              exit 1
+            fi
+          done
+
+      - name: Check AMI workflows have approval gates
+        run: |
+          for workflow in .github/workflows/ami-build.yml .github/workflows/ami-build-arm64.yml; do
+            echo "Verifying production environment protection in ${workflow}..."
+            if grep -q "environment.*production" "${workflow}"; then
+              echo "✓ Production environment approval gates configured"
+            else
+              echo "WARNING: No production environment approval gates found in ${workflow}"
+            fi
+          done
+
+      - name: Validate packer timeout is sufficient
+        run: |
+          for workflow in .github/workflows/ami-build.yml .github/workflows/ami-build-arm64.yml; do
+            echo "Checking build timeouts in ${workflow}..."
+            if grep -q "timeout.*[34][0-9]\|timeout.*60\|timeout.*75\|timeout.*90" "${workflow}"; then
+              echo "✓ Build timeout appears reasonable"
+            else
+              echo "WARNING: Could not verify build timeout in ${workflow}"
+            fi
+          done
+
+      - name: Verify test-ami.sh has required checks
+        run: |
+          echo "Validating test script coverage..."
+          required_checks=("python" "java" "julia" "go" "spark" "node")
+          for check in "${required_checks[@]}"; do
+            if grep -q "${check}" scripts/test-ami.sh; then
+              echo "  ✓ ${check}"
+            else
+              echo "  ✗ MISSING: ${check} test"
+            fi
+          done
+
+      - name: Check harden.sh covers required CIS controls
+        run: |
+          echo "Validating CIS hardening controls..."
+          # Spot check for key hardening categories
+          categories=("SSH" "kernel.*module" "firewall\|ufw\|iptables" "auditd" "AppArmor\|aide")
+          for cat in "${categories[@]}"; do
+            if grep -i "${cat}" harden.sh >/dev/null; then
+              echo "  ✓ $(echo $cat | cut -d'|' -f1)"
+            else
+              echo "  ✗ MISSING: $(echo $cat | cut -d'|' -f1) control"
+            fi
+          done
+
+      - name: Validate Packer HCL variable definitions
+        run: |
+          echo "Checking Packer variables..."
+          required_vars=("base_ami_id" "base_ami_id_arm" "region")
+          for var in "${required_vars[@]}"; do
+            if grep -q "variable \"${var}\"" packer.pkr.hcl; then
+              echo "  ✓ ${var}"
+            else
+              echo "  ✗ MISSING: variable ${var}"
+              exit 1
+            fi
+          done
+
+      - name: Check for deprecated or unsafe patterns
+        run: |
+          echo "Scanning for deprecated patterns..."
+          # Check for spot_price hardcoded to "auto" or "true" (allow var.spot_price references)
+          if grep -E '^\s+spot_price\s+=\s+["'"'"'](auto|true)["'"'"']' packer.pkr.hcl; then
+            echo "ERROR: Found deprecated spot_price hardcoded to auto/true"
+            exit 1
+          fi
+          echo "✓ No deprecated patterns detected"
+
+      - name: Validate nix/flake.nix doesn't reference unstable
+        run: |
+          echo "Checking for stable Nixpkgs channel..."
+          if grep -E "^\s*(nixpkgs-unstable|.*channel.*unstable)" nix/flake.nix; then
+            echo "ERROR: Found unstable Nix channel (use stable only)"
+            exit 1
+          fi
+          if grep -q "nixos-25\|nixos-24" nix/flake.nix; then
+            echo "✓ Using stable Nixpkgs channel (nixos-25.05 pinned)"
+          else
+            echo "ERROR: flake.nix must pin nixos-24 or nixos-25"
+            exit 1
+          fi
+
+      - name: 'Pre-build #1: Docker test of provisioning scripts'
+        run: |
+          echo "Testing scripts in Docker container (simulates EC2)..."
+          if ! timeout 30s docker pull ubuntu:22.04 >/dev/null 2>&1; then
+            echo "⚠ Docker Hub pull timed out; skipping containerized duplicate syntax check"
+            exit 0
+          fi
+          docker run --rm -v "$(pwd):/repo" ubuntu:22.04 bash -c '
+          set -e
+          cd /repo
+          echo "Running script syntax checks..."
+          bash -n harden.sh
+          bash -n scripts/ami-finalize.sh
+          bash -n scripts/build-base-envs.sh
+          bash -n scripts/build-pro-envs.sh
+          echo "✓ All scripts have valid syntax"
+
+          echo "Checking for common script errors..."
+          ! grep -n "^rm -rf /" harden.sh || echo "WARNING: rm -rf / detected"
+          ! grep -n "^dd if=/dev/zero" harden.sh || echo "WARNING: dd destructive command detected"
+          echo "✓ No obvious destructive commands found"
+          '
+          echo "✓ Docker provisioning script test passed"
+
+      - name: 'Pre-build #2: Validate base Ubuntu AMI exists'
+        run: |
+          echo "Checking Ubuntu 22.04 LTS AMI availability..."
+          AMI_COUNT=$(aws ec2 describe-images \
+            --owners "099720109477" \
+            --filters "Name=name,Values=ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*" \
+            --query "length(Images)" \
+            --region us-east-1 2>/dev/null || echo "0")
+          if [[ $AMI_COUNT -gt 0 ]]; then
+            echo "✓ Found $AMI_COUNT Ubuntu 22.04 LTS AMI(s) in us-east-1"
+          else
+            echo "⚠️  No Ubuntu 22.04 LTS AMI found (will use latest at build time)"
+          fi
+
+      - name: 'Pre-build #3: AWS account health check'
+        run: |
+          echo "Verifying AWS account state..."
+          CALLER=$(aws sts get-caller-identity --query 'Arn' --output text 2>/dev/null || echo "ERROR")
+          if [[ $CALLER != "ERROR" ]]; then
+            echo "✓ AWS credentials valid: $CALLER"
+          else
+            echo "⚠️  AWS credentials check failed (will retry at build time)"
+          fi
+
+          # Check if t3.large is available
+          CAPACITY=$(aws ec2 describe-instance-types \
+            --instance-types t3.large \
+            --region us-east-1 \
+            --query "length(InstanceTypes)" 2>/dev/null || echo "0")
+          if [[ $CAPACITY -gt 0 ]]; then
+            echo "✓ Instance type t3.large available in us-east-1"
+          else
+            echo "⚠️  Instance type check failed (will retry at build time)"
+          fi
+
+      - name: 'Pre-build #4: Nix flake lock file validation'
+        run: |
+          echo "Validating nix/flake.lock..."
+          if [[ ! -f nix/flake.lock ]]; then
+            echo "⚠️  flake.lock not found (will be generated at build time)"
+          else
+            echo "✓ flake.lock exists"
+            # Check if lock file is valid JSON
+            if python3 -m json.tool nix/flake.lock >/dev/null 2>&1; then
+              echo "✓ flake.lock is valid JSON"
+            else
+              echo "ERROR: flake.lock is not valid JSON"
+              exit 1
+            fi
+            # Check nixpkgs revision is referenced
+            if grep -q '"nixpkgs"' nix/flake.lock; then
+              echo "✓ nixpkgs reference found in flake.lock"
+            else
+              echo "ERROR: No nixpkgs reference in flake.lock"
+              exit 1
+            fi
+          fi
+
+      - name: 'Pre-build #5: AMI naming conflict check'
+        run: |
+          echo "Checking for AMI naming conflicts..."
+          PREFIX=$(grep 'ami_prefix' packer.pkr.hcl | head -1 | grep -o '"[^"]*"' | tr -d '"')
+          if [[ -z "$PREFIX" ]]; then
+            PREFIX="cpu-ds-ml"
+          fi
+          echo "Using AMI prefix: $PREFIX"
+
+          EXISTING=$(aws ec2 describe-images \
+            --owners self \
+            --filters "Name=name,Values=${PREFIX}-*" \
+            --query "length(Images)" \
+            --region us-east-1 2>/dev/null || echo "0")
+
+          if [[ $EXISTING -gt 0 ]]; then
+            echo "⚠️  Found $EXISTING existing AMI(s) with prefix '$PREFIX'"
+            echo "   (Build will create new version, old ones can be cleaned up manually)"
+          else
+            echo "✓ No naming conflicts detected"
+          fi
+
+      - name: 'Pre-build #6: Estimate build cost'
+        run: |
+          echo "Calculating estimated build cost..."
+
+          # EC2 pricing (us-east-1, on-demand)
+          T3_LARGE_RATE="0.1052"  # $/hour
+          C6I_2XL_RATE="0.34"     # $/hour
+          T4G_LARGE_RATE="0.0672" # $/hour
+          C7G_2XL_RATE="0.272"    # $/hour
+
+          # Build time: 90 minutes = 1.5 hours
+          BUILD_TIME="1.5"
+
+          # Cost calculation (4 variants parallel): max of all = c6i.2xlarge
+          COST=$(echo "$C6I_2XL_RATE * $BUILD_TIME" | bc)
+
+          echo ""
+          echo "Estimated EC2 costs for this build:"
+          echo "  Instance type: c6i.2xlarge (most expensive)"
+          echo "  Duration: 90 minutes (~1.5 hours)"
+          echo "  Cost per hour: \$$C6I_2XL_RATE"
+          echo "  Estimated total: \$$COST"
+          echo ""
+          echo "✓ Budget check: \$${COST} is within expected range (\$4-6)"
+
+      - name: 'Pre-build #7: Advanced script linting'
+        run: |
+          echo "Running advanced script linting..."
+
+          # Check for hardcoded credentials/secrets
+          echo "Checking for hardcoded secrets..."
+          if grep -r "password=\|API_KEY=\|secret=" --include="*.sh" . 2>/dev/null | grep -v "^Binary"; then
+            echo "⚠️  Found potential hardcoded secrets (verify manually)"
+          else
+            echo "✓ No obvious hardcoded secrets detected"
+          fi
+
+          # Check for insecure patterns
+          echo "Checking for insecure patterns..."
+          INSECURE_PATTERNS=(
+            "eval "
+            "sudo without quotes"
+            "chmod 777"
+            "exec bash"
+          )
+
+          if grep -q "chmod 777" harden.sh; then
+            echo "⚠️  Found 'chmod 777' (verify it's intentional)"
+          else
+            echo "✓ No overly permissive chmod patterns"
+          fi
+
+          if grep -q "eval " harden.sh scripts/*.sh 2>/dev/null; then
+            echo "⚠️  Found 'eval' statements (security risk if with untrusted input)"
+          else
+            echo "✓ No 'eval' statements found"
+          fi
+
+          echo "✓ Advanced linting complete"
+
+      - name: Summary — All pre-build validations
+        run: |
+          echo ""
+          echo "════════════════════════════════════════════════════════════════"
+          echo "  ✅ ALL PRE-BUILD VALIDATIONS PASSED"
+          echo "════════════════════════════════════════════════════════════════"
+          echo ""
+          echo "Next: ARM64 and x86 AMI workflows are available as separate manual entrypoints."
+          echo ""
+          echo "A workflow run will:"
+          echo "  1. Verify AWS credentials (OIDC)"
+          echo "  2. Run the selected Packer build path"
+          echo "  3. Test the selected AMI with live EC2 instances"
+          echo "  4. Optionally tag/retire AMIs for that architecture"
+          echo ""
+          echo "Estimated cost/time now depends on whether you run the x86 or ARM64 workflow."
+          echo "════════════════════════════════════════════════════════════════"

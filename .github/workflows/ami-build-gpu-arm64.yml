@@ -1,0 +1,582 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Bharath Kumar Gajjela
+#
+# ami-build-gpu-arm64.yml — ARM64/Graviton GPU AMI build, test, and tagging.
+#
+# Mirrors ami-build-gpu-x86.yml. Builds + tests on g5g.xlarge (NVIDIA T4G).
+# NOTE: on aarch64 PyTorch is GPU-enabled (cu128 wheels) but TensorFlow stays
+# CPU-only — there is no official aarch64 TF GPU wheel. See build-gpu-envs.sh.
+#
+# Required secret: AWS_ROLE_ARN (OIDC). Optional: PACKER_SUBNET_ID.
+
+name: GPU AMI Build & Test (ARM64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Build target'
+        type: choice
+        default: base
+        options:
+          - base
+          - pro
+      region:
+        description: 'AWS region'
+        default: us-east-1
+      existing_gpu_arm_base_ami_id:
+        description: 'Optional existing GPU ARM base AMI ID to test/reuse'
+        default: ''
+      existing_gpu_arm_pro_ami_id:
+        description: 'Optional existing GPU ARM pro AMI ID to test/tag'
+        default: ''
+      direct_gpu_arm_pro_from_existing_base:
+        description: 'Build pro directly from existing_gpu_arm_base_ami_id'
+        type: boolean
+        default: false
+      direct_gpu_arm_test_from_existing_pro:
+        description: 'Test/tag directly from existing_gpu_arm_pro_ami_id'
+        type: boolean
+        default: false
+      version_tag:
+        description: 'Release tag to apply to built AMIs (e.g. v1.0.1)'
+        default: ''
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_DEFAULT_REGION: ${{ github.event.inputs.region || 'us-east-1' }}
+  PACKER_LOG: 1
+  PACKER_LOG_PATH: /tmp/packer.log
+  GPU_ARM_BASE_TEST_CONTRACT_VERSION: gpu-arm-base-runtime-v1
+  GPU_INSTANCE_TYPE: g5g.xlarge
+  GPU_ROOT_VOLUME_SIZE: '80'
+
+jobs:
+  validate:
+    name: Packer validate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Install Packer
+        run: |
+          curl -fsSL https://apt.releases.hashicorp.com/gpg \
+            | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp.gpg
+          echo "deb [signed-by=/usr/share/keyrings/hashicorp.gpg] \
+            https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/hashicorp.list
+          sudo apt-get update -q && sudo apt-get install -y packer
+      - name: Packer init + validate
+        run: |
+          packer init .
+          packer validate \
+            -var subnet_id=subnet-placeholder \
+            -var security_group_id=sg-placeholder \
+            -var base_ami_id=ami-00000000000000000 \
+            -var base_ami_id_arm=ami-00000000000000000 \
+            -var gpu_base_ami_id=ami-00000000000000000 \
+            -var gpu_base_ami_id_arm=ami-00000000000000000 \
+            .
+
+# ── GPU ARM base ──────────────────────────────────────────────────────────────
+  build-gpu-arm-base:
+    name: Build GPU ARM base AMI
+    needs: validate
+    environment: production
+    if: success() && contains(fromJSON('["base","pro"]'), github.event.inputs.target) && github.event.inputs.existing_gpu_arm_base_ami_id == '' && github.event.inputs.direct_gpu_arm_test_from_existing_pro != 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    outputs:
+      ami_id: ${{ steps.packer.outputs.ami_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c  # v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+          role-duration-seconds: 7200
+          audience: sts.amazonaws.com
+      - name: Mask sensitive values from logs
+        run: |
+          echo "::add-mask::${AWS_DEFAULT_REGION}"
+          IDENTITY=$(aws sts get-caller-identity)
+          ACCOUNT_ID=$(echo "$IDENTITY" | python3 -c "import sys,json; print(json.load(sys.stdin)['Account'])")
+          USER_ID=$(echo "$IDENTITY"    | python3 -c "import sys,json; print(json.load(sys.stdin)['UserId'])")
+          CALLER_ARN=$(echo "$IDENTITY" | python3 -c "import sys,json; print(json.load(sys.stdin)['Arn'])")
+          echo "::add-mask::${ACCOUNT_ID}"; echo "::add-mask::${USER_ID}"; echo "::add-mask::${CALLER_ARN}"
+          echo "::add-mask::${{ secrets.AWS_ROLE_ARN }}"
+          ROLE_ID=$(echo "${USER_ID}" | cut -d: -f1)
+          [[ -n "$ROLE_ID" && "$ROLE_ID" != "$USER_ID" ]] && echo "::add-mask::${ROLE_ID}"
+          for q in 'Vpcs[].VpcId:describe-vpcs' 'Subnets[].SubnetId:describe-subnets' 'SecurityGroups[].GroupId:describe-security-groups'; do
+            cmd="${q##*:}"; path="${q%%:*}"
+            aws ec2 $cmd --query "$path" --output text --region "${AWS_DEFAULT_REGION}" \
+              | tr '\t' '\n' | while read -r ID; do [[ -n "$ID" ]] && echo "::add-mask::${ID}"; done
+          done
+          if [[ -n "${{ secrets.PACKER_SUBNET_ID }}" ]]; then echo "::add-mask::${{ secrets.PACKER_SUBNET_ID }}"; fi
+      - name: Install Packer
+        run: |
+          curl -fsSL https://apt.releases.hashicorp.com/gpg \
+            | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp.gpg
+          echo "deb [signed-by=/usr/share/keyrings/hashicorp.gpg] \
+            https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/hashicorp.list
+          sudo apt-get update -q && sudo apt-get install -y packer
+      - name: Resolve subnet (GPU capacity)
+        id: net
+        run: |
+          SUBNET="${{ secrets.PACKER_SUBNET_ID }}"
+          if [[ -z "$SUBNET" ]]; then
+            OFFERED_AZS="$(aws ec2 describe-instance-type-offerings \
+              --location-type availability-zone \
+              --filters Name=instance-type,Values="${GPU_INSTANCE_TYPE}" \
+              --query 'InstanceTypeOfferings[].Location' --output text)"
+            while read -r subnet_id az available_ips; do
+              [[ -z "${subnet_id:-}" ]] && continue
+              if grep -qw "$az" <<<"$OFFERED_AZS"; then SUBNET="$subnet_id"; break; fi
+            done < <(
+              aws ec2 describe-subnets \
+                --filters Name=state,Values=available Name=map-public-ip-on-launch,Values=true \
+                --query 'Subnets[].{id:SubnetId,az:AvailabilityZone,ips:AvailableIpAddressCount}' \
+                --output text | sort -k3,3nr
+            )
+            [[ -z "$SUBNET" ]] && SUBNET=$(aws ec2 describe-subnets --filters Name=defaultForAz,Values=true \
+              --query 'Subnets[0].SubnetId' --output text)
+          fi
+          echo "subnet_id=${SUBNET}" >> "$GITHUB_OUTPUT"
+      - name: Packer build — GPU ARM base
+        id: packer
+        run: |
+          set +e
+          packer init .
+          packer build \
+            -machine-readable \
+            -only=gpu-ds-ml-arm64-base.amazon-ebs.gpu_arm_base \
+            -var "region=${AWS_DEFAULT_REGION}" \
+            -var "subnet_id=${{ steps.net.outputs.subnet_id }}" \
+            -var "gpu_arm_instance_type=${GPU_INSTANCE_TYPE}" \
+            -var "root_volume_size=${GPU_ROOT_VOLUME_SIZE}" \
+            -var "associate_public_ip=true" \
+            . > /tmp/packer-build.raw.log 2>&1
+          status=$?
+          AMI_ID=$(grep ',artifact,0,id,' /tmp/packer-build.raw.log | grep -oE 'ami-[0-9a-f]{17}' | head -1)
+          if [[ -z "$AMI_ID" ]]; then
+            AMI_ID=$(aws ec2 describe-images --owners self \
+              --filters "Name=name,Values=gpu-ds-ml-ubuntu-2204-arm64-base-*" \
+              --query 'sort_by(Images, &CreationDate)[-1].ImageId' \
+              --output text --region "$AWS_DEFAULT_REGION")
+          fi
+          python3 scripts/sanitize-log.py /tmp/packer-build.raw.log /tmp/packer-build.log
+          cat /tmp/packer-build.log
+          [[ $status -ne 0 ]] && exit $status
+          [[ -z "$AMI_ID" || "$AMI_ID" == "None" ]] && { echo "ERROR: AMI ID not found"; exit 1; }
+          aws ec2 create-tags --resources "$AMI_ID" --region "$AWS_DEFAULT_REGION" \
+            --tags \
+              "Key=TestContractVersion,Value=${GPU_ARM_BASE_TEST_CONTRACT_VERSION}" \
+              "Key=BaseRuntimeContract,Value=cuda128-driver570-py311-py312-py313" \
+              "Key=SourceCommit,Value=${GITHUB_SHA}"
+          echo "ami_id=${AMI_ID}" >> "$GITHUB_OUTPUT"
+      - name: Upload Packer log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: packer-log-gpu-arm-base
+          path: /tmp/packer-build.log
+          retention-days: 3
+
+  guard-gpu-arm-base-test-contract:
+    name: Guard GPU ARM base test contract
+    needs: [validate, build-gpu-arm-base]
+    environment: production
+    if: |
+      always() &&
+      needs.validate.result == 'success' &&
+      github.event.inputs.direct_gpu_arm_pro_from_existing_base != 'true' &&
+      github.event.inputs.direct_gpu_arm_test_from_existing_pro != 'true' &&
+      contains(fromJSON('["base","pro"]'), github.event.inputs.target) &&
+      (
+        github.event.inputs.existing_gpu_arm_base_ami_id != '' ||
+        needs.build-gpu-arm-base.result == 'success'
+      )
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    outputs:
+      ami_id: ${{ steps.guard.outputs.ami_id }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c  # v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+          role-duration-seconds: 3600
+          audience: sts.amazonaws.com
+      - name: Validate GPU ARM base AMI test contract
+        id: guard
+        run: |
+          AMI_ID="${{ github.event.inputs.existing_gpu_arm_base_ami_id }}"
+          [[ -z "$AMI_ID" ]] && AMI_ID="${{ needs.build-gpu-arm-base.outputs.ami_id }}"
+          [[ -z "$AMI_ID" ]] && { echo "ERROR: no AMI ID resolved"; exit 1; }
+          CONTRACT=$(aws ec2 describe-images --image-ids "$AMI_ID" --region "$AWS_DEFAULT_REGION" \
+            --query 'Images[0].Tags[?Key==`TestContractVersion`].Value | [0]' --output text)
+          if [[ "$CONTRACT" != "${GPU_ARM_BASE_TEST_CONTRACT_VERSION}" ]]; then
+            echo "ERROR: AMI $AMI_ID does not satisfy contract ${GPU_ARM_BASE_TEST_CONTRACT_VERSION} (found ${CONTRACT:-<missing>})"; exit 1
+          fi
+          echo "ami_id=${AMI_ID}" >> "$GITHUB_OUTPUT"
+
+  test-gpu-arm-base:
+    name: Test GPU ARM base AMI
+    needs: [validate, build-gpu-arm-base, guard-gpu-arm-base-test-contract]
+    environment: production
+    if: |
+      always() &&
+      needs.validate.result == 'success' &&
+      github.event.inputs.direct_gpu_arm_pro_from_existing_base != 'true' &&
+      github.event.inputs.direct_gpu_arm_test_from_existing_pro != 'true' &&
+      needs.guard-gpu-arm-base-test-contract.result == 'success' &&
+      contains(fromJSON('["base","pro"]'), github.event.inputs.target) &&
+      (
+        github.event.inputs.existing_gpu_arm_base_ami_id != '' ||
+        needs.build-gpu-arm-base.result == 'success'
+      )
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    outputs:
+      ami_id: ${{ steps.passthrough.outputs.ami_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c  # v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+          role-duration-seconds: 7200
+          audience: sts.amazonaws.com
+      - name: Run AMI tests — GPU ARM base
+        env:
+          GPU_AMI: '1'
+          TEST_INSTANCE_TYPE: g5g.xlarge
+        run: |
+          chmod +x scripts/test-ami.sh
+          scripts/test-ami.sh "${{ needs.guard-gpu-arm-base-test-contract.outputs.ami_id }}" arm64 base
+      - name: Upload AMI scan reports — GPU ARM base
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: ami-scan-gpu-arm-base
+          path: /tmp/ami-scan-artifacts/arm64-base
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Pass AMI ID to tag job
+        id: passthrough
+        run: echo "ami_id=${{ needs.guard-gpu-arm-base-test-contract.outputs.ami_id }}" >> "$GITHUB_OUTPUT"
+
+# ── GPU ARM pro ───────────────────────────────────────────────────────────────
+  build-gpu-arm-pro:
+    name: Build GPU ARM pro AMI
+    needs: [validate, test-gpu-arm-base, guard-gpu-arm-base-test-contract]
+    environment: production
+    if: |
+      always() &&
+      needs.validate.result == 'success' &&
+      github.event.inputs.direct_gpu_arm_test_from_existing_pro != 'true' &&
+      github.event.inputs.target == 'pro' &&
+      (
+        (
+          github.event.inputs.direct_gpu_arm_pro_from_existing_base == 'true' &&
+          github.event.inputs.existing_gpu_arm_base_ami_id != ''
+        ) ||
+        needs.test-gpu-arm-base.result == 'success'
+      )
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    outputs:
+      ami_id: ${{ steps.packer.outputs.ami_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c  # v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+          role-duration-seconds: 7200
+          audience: sts.amazonaws.com
+      - name: Mask sensitive values from logs
+        run: |
+          echo "::add-mask::${AWS_DEFAULT_REGION}"
+          IDENTITY=$(aws sts get-caller-identity)
+          ACCOUNT_ID=$(echo "$IDENTITY" | python3 -c "import sys,json; print(json.load(sys.stdin)['Account'])")
+          USER_ID=$(echo "$IDENTITY"    | python3 -c "import sys,json; print(json.load(sys.stdin)['UserId'])")
+          CALLER_ARN=$(echo "$IDENTITY" | python3 -c "import sys,json; print(json.load(sys.stdin)['Arn'])")
+          echo "::add-mask::${ACCOUNT_ID}"; echo "::add-mask::${USER_ID}"; echo "::add-mask::${CALLER_ARN}"
+          echo "::add-mask::${{ secrets.AWS_ROLE_ARN }}"
+          ROLE_ID=$(echo "${USER_ID}" | cut -d: -f1)
+          [[ -n "$ROLE_ID" && "$ROLE_ID" != "$USER_ID" ]] && echo "::add-mask::${ROLE_ID}"
+          for q in 'Vpcs[].VpcId:describe-vpcs' 'Subnets[].SubnetId:describe-subnets' 'SecurityGroups[].GroupId:describe-security-groups'; do
+            cmd="${q##*:}"; path="${q%%:*}"
+            aws ec2 $cmd --query "$path" --output text --region "${AWS_DEFAULT_REGION}" \
+              | tr '\t' '\n' | while read -r ID; do [[ -n "$ID" ]] && echo "::add-mask::${ID}"; done
+          done
+          if [[ -n "${{ secrets.PACKER_SUBNET_ID }}" ]]; then echo "::add-mask::${{ secrets.PACKER_SUBNET_ID }}"; fi
+      - name: Install Packer
+        run: |
+          curl -fsSL https://apt.releases.hashicorp.com/gpg \
+            | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp.gpg
+          echo "deb [signed-by=/usr/share/keyrings/hashicorp.gpg] \
+            https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/hashicorp.list
+          sudo apt-get update -q && sudo apt-get install -y packer
+      - name: Resolve subnet (GPU capacity)
+        id: net
+        run: |
+          SUBNET="${{ secrets.PACKER_SUBNET_ID }}"
+          if [[ -z "$SUBNET" ]]; then
+            OFFERED_AZS="$(aws ec2 describe-instance-type-offerings \
+              --location-type availability-zone \
+              --filters Name=instance-type,Values="${GPU_INSTANCE_TYPE}" \
+              --query 'InstanceTypeOfferings[].Location' --output text)"
+            while read -r subnet_id az available_ips; do
+              [[ -z "${subnet_id:-}" ]] && continue
+              if grep -qw "$az" <<<"$OFFERED_AZS"; then SUBNET="$subnet_id"; break; fi
+            done < <(
+              aws ec2 describe-subnets \
+                --filters Name=state,Values=available Name=map-public-ip-on-launch,Values=true \
+                --query 'Subnets[].{id:SubnetId,az:AvailabilityZone,ips:AvailableIpAddressCount}' \
+                --output text | sort -k3,3nr
+            )
+            [[ -z "$SUBNET" ]] && SUBNET=$(aws ec2 describe-subnets --filters Name=defaultForAz,Values=true \
+              --query 'Subnets[0].SubnetId' --output text)
+          fi
+          echo "subnet_id=${SUBNET}" >> "$GITHUB_OUTPUT"
+      - name: Packer build — GPU ARM pro
+        id: packer
+        run: |
+          set +e
+          BASE_AMI_ID="${{ github.event.inputs.existing_gpu_arm_base_ami_id }}"
+          if [[ "${{ github.event.inputs.direct_gpu_arm_pro_from_existing_base }}" != "true" ]]; then
+            BASE_AMI_ID="${{ needs.guard-gpu-arm-base-test-contract.outputs.ami_id }}"
+          fi
+          [[ -z "$BASE_AMI_ID" || "$BASE_AMI_ID" == "None" ]] && { echo "ERROR: base AMI ID not found"; exit 1; }
+          packer init .
+          packer build \
+            -machine-readable \
+            -only=gpu-ds-ml-arm64-pro.amazon-ebs.gpu_arm_pro \
+            -var "region=${AWS_DEFAULT_REGION}" \
+            -var "subnet_id=${{ steps.net.outputs.subnet_id }}" \
+            -var "gpu_arm_instance_type=${GPU_INSTANCE_TYPE}" \
+            -var "gpu_base_ami_id_arm=${BASE_AMI_ID}" \
+            -var "root_volume_size=${GPU_ROOT_VOLUME_SIZE}" \
+            -var "associate_public_ip=true" \
+            . > /tmp/packer-build.raw.log 2>&1
+          status=$?
+          AMI_ID=$(grep ',artifact,0,id,' /tmp/packer-build.raw.log | grep -oE 'ami-[0-9a-f]{17}' | head -1)
+          if [[ -z "$AMI_ID" ]]; then
+            AMI_ID=$(aws ec2 describe-images --owners self \
+              --filters "Name=name,Values=gpu-ds-ml-ubuntu-2204-arm64-pro-*" \
+              --query 'sort_by(Images, &CreationDate)[-1].ImageId' \
+              --output text --region "$AWS_DEFAULT_REGION")
+          fi
+          python3 scripts/sanitize-log.py /tmp/packer-build.raw.log /tmp/packer-build.log
+          cat /tmp/packer-build.log
+          [[ $status -ne 0 ]] && exit $status
+          [[ -z "$AMI_ID" || "$AMI_ID" == "None" ]] && { echo "ERROR: AMI ID not found"; exit 1; }
+          echo "ami_id=${AMI_ID}" >> "$GITHUB_OUTPUT"
+      - name: Upload Packer log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: packer-log-gpu-arm-pro
+          path: /tmp/packer-build.log
+          retention-days: 3
+
+  test-gpu-arm-pro:
+    name: Test GPU ARM pro AMI
+    needs: [validate, build-gpu-arm-pro]
+    environment: production
+    if: |
+      always() &&
+      needs.validate.result == 'success' &&
+      github.event.inputs.target == 'pro' &&
+      (
+        (
+          github.event.inputs.direct_gpu_arm_test_from_existing_pro == 'true' &&
+          github.event.inputs.existing_gpu_arm_pro_ami_id != ''
+        ) ||
+        needs.build-gpu-arm-pro.result == 'success'
+      )
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    outputs:
+      ami_id: ${{ steps.passthrough.outputs.ami_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c  # v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+          role-duration-seconds: 7200
+          audience: sts.amazonaws.com
+      - name: Run AMI tests — GPU ARM pro
+        env:
+          GPU_AMI: '1'
+          TEST_INSTANCE_TYPE: g5g.xlarge
+        run: |
+          chmod +x scripts/test-ami.sh
+          AMI_ID="${{ github.event.inputs.existing_gpu_arm_pro_ami_id }}"
+          if [[ "${{ github.event.inputs.direct_gpu_arm_test_from_existing_pro }}" != "true" ]]; then
+            AMI_ID="${{ needs.build-gpu-arm-pro.outputs.ami_id }}"
+          fi
+          scripts/test-ami.sh "${AMI_ID}" arm64 pro
+      - name: Upload AMI scan reports — GPU ARM pro
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: ami-scan-gpu-arm-pro
+          path: /tmp/ami-scan-artifacts/arm64-pro
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Pass AMI ID to tag job
+        id: passthrough
+        run: |
+          AMI_ID="${{ github.event.inputs.existing_gpu_arm_pro_ami_id }}"
+          if [[ "${{ github.event.inputs.direct_gpu_arm_test_from_existing_pro }}" != "true" ]]; then
+            AMI_ID="${{ needs.build-gpu-arm-pro.outputs.ami_id }}"
+          fi
+          echo "ami_id=${AMI_ID}" >> "$GITHUB_OUTPUT"
+
+# ── Tag AMIs ──────────────────────────────────────────────────────────────────
+  tag-release:
+    name: Tag GPU ARM AMIs with release version
+    needs: [test-gpu-arm-base, test-gpu-arm-pro]
+    environment: production
+    if: |
+      always() &&
+      github.event.inputs.version_tag != '' &&
+      (needs.test-gpu-arm-base.result == 'success' || needs.test-gpu-arm-base.result == 'skipped') &&
+      (needs.test-gpu-arm-pro.result == 'success' || needs.test-gpu-arm-pro.result == 'skipped') &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c  # v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+          role-duration-seconds: 7200
+          audience: sts.amazonaws.com
+      - name: Tag all built GPU ARM AMIs
+        env:
+          VERSION: ${{ github.event.inputs.version_tag }}
+        run: |
+          REGION="${AWS_DEFAULT_REGION}"
+          tag_ami() {
+            local ami_id="$1" label="$2"
+            [[ -z "$ami_id" || "$ami_id" == "null" ]] && return 0
+            aws ec2 create-tags --resources "$ami_id" --region "$REGION" \
+              --tags "Key=Version,Value=${VERSION}" \
+                     "Key=ReleasedAt,Value=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                     "Key=Pipeline,Value=ami-build-gpu-arm64" \
+                     "Key=Label,Value=${label}"
+            echo "Tagged ${ami_id} (${label}) with ${VERSION}"
+          }
+          tag_ami "${{ needs.test-gpu-arm-base.outputs.ami_id }}" "gpu-arm-base"
+          tag_ami "${{ needs.test-gpu-arm-pro.outputs.ami_id }}"  "gpu-arm-pro"
+      - name: Retire old GPU ARM AMIs (keep latest 1 of each)
+        run: |
+          REGION="${AWS_DEFAULT_REGION}"
+          retire_old_amis() {
+            local name_filter="$1"
+            OLD_AMIS=$(aws ec2 describe-images --owners self \
+              --filters "Name=name,Values=${name_filter}" \
+              --query "reverse(sort_by(Images, &CreationDate))[1:].ImageId" \
+              --output text --region "$REGION")
+            [[ -z "$OLD_AMIS" || "$OLD_AMIS" == "None" ]] && { echo "Nothing to retire for ${name_filter}."; return 0; }
+            for AMI_ID in $OLD_AMIS; do
+              SNAPS=$(aws ec2 describe-images --image-ids "$AMI_ID" \
+                --query 'Images[].BlockDeviceMappings[].Ebs.SnapshotId' --output text --region "$REGION")
+              aws ec2 deregister-image --image-id "$AMI_ID" --region "$REGION"
+              echo "Retired: $AMI_ID (${name_filter})"
+              for SNAP in $SNAPS; do
+                aws ec2 delete-snapshot --snapshot-id "$SNAP" --region "$REGION" && echo "  Deleted snapshot: $SNAP"
+              done
+            done
+          }
+          retire_old_amis "gpu-ds-ml-ubuntu-2204-arm64-base-*"
+          retire_old_amis "gpu-ds-ml-ubuntu-2204-arm64-pro-*"
+
+# ── Safety-net cleanup ────────────────────────────────────────────────────────
+  cleanup-orphans:
+    name: Terminate orphaned test instances
+    needs: [test-gpu-arm-base, test-gpu-arm-pro]
+    if: |
+      always() &&
+      (
+        needs.test-gpu-arm-base.result != 'skipped' ||
+        needs.test-gpu-arm-pro.result != 'skipped'
+      )
+    runs-on: ubuntu-22.04
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c  # v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+          role-duration-seconds: 7200
+          audience: sts.amazonaws.com
+      - name: Terminate orphaned test instances
+        run: |
+          REGION="${AWS_DEFAULT_REGION}"
+          INSTANCE_IDS=$(aws ec2 describe-instances \
+            --filters "Name=tag:Purpose,Values=ami-ci-test" \
+                      "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query 'Reservations[].Instances[].InstanceId' --output text --region "$REGION")
+          if [[ -z "$INSTANCE_IDS" || "$INSTANCE_IDS" == "None" ]]; then
+            echo "No orphaned test instances."
+          else
+            echo "Terminating: $INSTANCE_IDS"
+            # shellcheck disable=SC2086
+            aws ec2 terminate-instances --instance-ids $INSTANCE_IDS --region "$REGION" \
+              --query 'TerminatingInstances[].{ID:InstanceId,State:CurrentState.Name}' --output table
+          fi
+      - name: Delete orphaned key pairs
+        run: |
+          REGION="${AWS_DEFAULT_REGION}"
+          KEY_NAMES=$(aws ec2 describe-key-pairs --filters "Name=key-name,Values=ami-test-*" \
+            --query 'KeyPairs[].KeyName' --output text --region "$REGION")
+          if [[ -z "$KEY_NAMES" || "$KEY_NAMES" == "None" ]]; then
+            echo "No orphaned key pairs."
+          else
+            for KN in $KEY_NAMES; do aws ec2 delete-key-pair --key-name "$KN" --region "$REGION"; echo "Deleted key pair: $KN"; done
+          fi
+      - name: Delete orphaned security groups
+        run: |
+          REGION="${AWS_DEFAULT_REGION}"
+          SG_IDS=$(aws ec2 describe-security-groups --filters "Name=group-name,Values=ami-test-*" \
+            --query 'SecurityGroups[].GroupId' --output text --region "$REGION")
+          if [[ -z "$SG_IDS" || "$SG_IDS" == "None" ]]; then
+            echo "No orphaned security groups."
+          else
+            for SG in $SG_IDS; do
+              IN_USE=$(aws ec2 describe-instances --filters "Name=instance.group-id,Values=${SG}" \
+                "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+                --query 'Reservations[].Instances[].InstanceId' --output text --region "$REGION")
+              if [[ -n "$IN_USE" && "$IN_USE" != "None" ]]; then
+                echo "Skipping $SG — still attached to $IN_USE"
+              else
+                aws ec2 delete-security-group --group-id "$SG" --region "$REGION" 2>/dev/null \
+                  && echo "Deleted SG: $SG" || echo "Could not delete $SG (may need retry)"
+              fi
+            done
+          fi

@@ -1,0 +1,74 @@
+name: Build OpenSCAP x86_64
+
+on:
+  workflow_dispatch:  # Manual trigger
+  push:
+    paths:
+      - '.github/workflows/build-openscap-x86.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build-x86:
+    runs-on: ubuntu-22.04
+    name: Build OpenSCAP x86_64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake git \
+            libxml2-dev libxslt1-dev \
+            libapt-pkg-dev libcurl4-openssl-dev \
+            libgcrypt-dev libdbus-1-dev \
+            libcap-dev libselinux1-dev \
+            libxmlsec1-dev libxmlsec1-openssl \
+            libacl1-dev libpopt-dev libpcre2-dev
+
+      - name: Clone OpenSCAP source
+        run: |
+          mkdir -p /tmp/openscap-src
+          cd /tmp/openscap-src
+          git clone https://github.com/OpenSCAP/openscap.git .
+
+      - name: Build OpenSCAP (x86_64)
+        run: |
+          cd /tmp/openscap-src
+          mkdir -p build
+          cd build
+          cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local -DENABLE_PYTHON=OFF
+          make -j$(nproc)
+          sudo make install
+          sudo ldconfig
+
+      - name: Verify oscap binary
+        run: /usr/local/bin/oscap --version
+
+      - name: Create x86_64 tarball
+        run: |
+          mkdir -p /tmp/oscap-x86/usr/local/bin
+          strip /usr/local/bin/oscap -o /tmp/oscap-x86/usr/local/bin/oscap 2>/dev/null || cp /usr/local/bin/oscap /tmp/oscap-x86/usr/local/bin/
+          cd /tmp/oscap-x86 && tar cf /tmp/openscap-ubuntu2204-x86_64.tar usr/
+          ls -lh /tmp/openscap-ubuntu2204-x86_64.tar
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="openscap-x86_64-$(date +%Y%m%d-%H%M%S)"
+          gh release create "$TAG" \
+            /tmp/openscap-ubuntu2204-x86_64.tar \
+            --title "OpenSCAP x86_64 — Ubuntu 22.04" \
+            --notes "Pre-built OpenSCAP binary for x86_64. Extract to / on target system." \
+            --repo "${{ github.repository }}"
+          echo "RELEASE_TAG=$TAG" >> $GITHUB_ENV
+
+      - name: Output
+        run: |
+          echo "Release: ${{ env.RELEASE_TAG }}"
+          echo "Download: https://github.com/${{ github.repository }}/releases/download/${{ env.RELEASE_TAG }}/openscap-ubuntu2204-x86_64.tar"

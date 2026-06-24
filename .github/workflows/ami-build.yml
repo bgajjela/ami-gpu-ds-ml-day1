@@ -1,0 +1,1106 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Dimenpoint
+#
+# ami-build.yml — x86_64 AMI build, test, and tagging pipeline.
+#
+# Triggered manually via workflow_dispatch. Builds x86 base/pro AMIs, tests
+# each on a live EC2 instance, then tags the resulting AMIs with a release
+# label.
+#
+# Required GitHub secrets:
+#   AWS_ROLE_ARN             ARN of the IAM role to assume via OIDC
+#                            e.g. arn:aws:iam::123456789012:role/github-ami-pipeline
+#                            One-time AWS setup:
+#                              1. Create OIDC provider for token.actions.githubusercontent.com
+#                              2. Create IAM role with trust policy scoped to this repo
+#                              3. Attach EC2 permissions listed below
+#                            See: https://docs.github.com/en/actions/security-for-github-actions/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services
+#
+# Optional GitHub secrets:
+#   PACKER_SUBNET_ID         Subnet for Packer build instances (auto-detected
+#                            from the default VPC if not set)
+#
+# Minimum IAM permissions for the CI user:
+#   ec2:DescribeVpcs, ec2:DescribeSubnets, ec2:DescribeInstances,
+#   ec2:DescribeInstanceStatus, ec2:DescribeImages, ec2:DescribeSecurityGroups,
+#   ec2:RunInstances, ec2:TerminateInstances, ec2:StopInstances,
+#   ec2:CreateImage, ec2:ModifyImageAttribute, ec2:DeregisterImage,
+#   ec2:CreateTags, ec2:DeleteTags,
+#   ec2:CreateSecurityGroup, ec2:DeleteSecurityGroup,
+#   ec2:AuthorizeSecurityGroupIngress, ec2:RevokeSecurityGroupIngress,
+#   ec2:CreateKeyPair, ec2:DeleteKeyPair,
+#   ec2:CreateSnapshot, ec2:DeleteSnapshot,
+#   ec2:CreateVolume, ec2:DeleteVolume,
+#   ec2:AttachVolume, ec2:DetachVolume
+
+name: AMI Build & Test (x86)
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Build target'
+        type: choice
+        default: base
+        options:
+          - base       # x86 base only
+          - pro        # x86 base → pro
+      region:
+        description: 'AWS region'
+        default: us-east-1
+      existing_x86_base_ami_id:
+        description: 'Optional existing x86 base AMI ID to test/reuse instead of rebuilding base'
+        default: ''
+      existing_x86_pro_ami_id:
+        description: 'Optional existing x86 pro AMI ID to test/tag instead of rebuilding pro'
+        default: ''
+      direct_x86_pro_from_existing_base:
+        description: 'Skip x86 base guard/test and build pro directly from existing_x86_base_ami_id'
+        type: boolean
+        default: false
+      direct_x86_test_from_existing_pro:
+        description: 'Skip x86 base/pro build steps and test/tag directly from existing_x86_pro_ami_id'
+        type: boolean
+        default: false
+      version_tag:
+        description: 'Release tag to apply to built AMIs (e.g. v1.0.1)'
+        default: ''
+
+# id-token:write is required for OIDC short-lived credential exchange.
+#
+# One-time setup — run these commands locally (requires IAM admin access):
+#
+#   ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+#
+#   # 1. Create OIDC provider (once per AWS account)
+#   aws iam create-open-id-connect-provider \
+#     --url https://token.actions.githubusercontent.com \
+#     --client-id-list sts.amazonaws.com \
+#     --thumbprint-list 6938fd4d98bab03faadb97b34396831e3780aea1
+#
+#   # 2. Create IAM role — trust scoped to the 'production' environment only.
+#   #    Using environment scope (not branch scope) means the OIDC token is only
+#   #    issued AFTER the required-reviewer approval gate is passed (Fix 2).
+#   cat > /tmp/oidc-trust.json << 'TRUSTEOF'
+#   {
+#     "Version": "2012-10-17",
+#     "Statement": [{
+#       "Effect": "Allow",
+#       "Principal": {
+#         "Federated": "arn:aws:iam::ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com"
+#       },
+#       "Action": "sts:AssumeRoleWithWebIdentity",
+#       "Condition": {
+#         "StringEquals": {
+#           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+#           "token.actions.githubusercontent.com:sub": "repo:bgajjela/aws-amis-ml:environment:production"
+#         }
+#       }
+#     }]
+#   }
+#   TRUSTEOF
+#   sed -i "s/ACCOUNT_ID/${ACCOUNT_ID}/g" /tmp/oidc-trust.json
+#   aws iam create-role --role-name github-ami-pipeline \
+#     --assume-role-policy-document file:///tmp/oidc-trust.json
+#
+#   # 3. Attach EC2 permissions (policy listed in header above)
+#   aws iam put-role-policy --role-name github-ami-pipeline \
+#     --policy-name ami-pipeline-ec2 --policy-document file:///tmp/ec2-policy.json
+#
+#   # 4. Add role ARN to GitHub secrets, remove old static keys
+#   gh secret set AWS_ROLE_ARN \
+#     --body "arn:aws:iam::${ACCOUNT_ID}:role/github-ami-pipeline"
+#   gh secret delete AWS_ACCESS_KEY_ID
+#   gh secret delete AWS_SECRET_ACCESS_KEY
+#
+#   # 5. Create 'production' environment in GitHub with required reviewer:
+#   #    Repo → Settings → Environments → New environment → "production"
+#   #    → Required reviewers → add yourself → Save
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_DEFAULT_REGION: ${{ github.event.inputs.region || 'us-east-1' }}
+  PACKER_LOG: 1
+  PACKER_LOG_PATH: /tmp/packer.log
+  X86_BASE_TEST_CONTRACT_VERSION: x86-base-runtime-v1
+
+# ── Validate ────────────────────────────────────────────────────────────────
+jobs:
+  validate:
+    name: Packer validate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Install Packer
+        run: |
+          curl -fsSL https://apt.releases.hashicorp.com/gpg \
+            | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp.gpg
+          echo "deb [signed-by=/usr/share/keyrings/hashicorp.gpg] \
+            https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/hashicorp.list
+          sudo apt-get update -q && sudo apt-get install -y packer
+
+      - name: Packer init + validate
+        run: |
+          packer init .
+          packer validate \
+            -var subnet_id=subnet-placeholder \
+            -var security_group_id=sg-placeholder \
+            -var base_ami_id=ami-00000000000000000 \
+            -var base_ami_id_arm=ami-00000000000000000 \
+            .
+
+      - name: Validate direct x86 pro inputs
+        if: ${{ github.event.inputs.direct_x86_pro_from_existing_base == 'true' }}
+        run: |
+          if [[ "${{ github.event.inputs.target }}" != "pro" ]]; then
+            echo "ERROR: direct_x86_pro_from_existing_base requires target=pro"
+            exit 1
+          fi
+          if [[ -z "${{ github.event.inputs.existing_x86_base_ami_id }}" ]]; then
+            echo "ERROR: direct_x86_pro_from_existing_base requires existing_x86_base_ami_id"
+            exit 1
+          fi
+
+      - name: Validate direct x86 pro test inputs
+        if: ${{ github.event.inputs.direct_x86_test_from_existing_pro == 'true' }}
+        run: |
+          if [[ "${{ github.event.inputs.target }}" != "pro" ]]; then
+            echo "ERROR: direct_x86_test_from_existing_pro requires target=pro"
+            exit 1
+          fi
+          if [[ -z "${{ github.event.inputs.existing_x86_pro_ami_id }}" ]]; then
+            echo "ERROR: direct_x86_test_from_existing_pro requires existing_x86_pro_ami_id"
+            exit 1
+          fi
+
+# ── x86 base ────────────────────────────────────────────────────────────────
+  build-x86-base:
+    name: Build x86 base AMI
+    needs: validate
+    environment: production
+    if: success() && contains(fromJSON('["base","pro"]'), github.event.inputs.target) && github.event.inputs.existing_x86_base_ami_id == '' && github.event.inputs.direct_x86_test_from_existing_pro != 'true'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 75
+    outputs:
+      ami_id: ${{ steps.packer.outputs.ami_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c  # v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+          role-duration-seconds: 7200
+          audience: sts.amazonaws.com
+
+      - name: Mask sensitive values from logs
+        run: |
+          # Mask AWS region
+          echo "::add-mask::${AWS_DEFAULT_REGION}"
+
+          IDENTITY=$(aws sts get-caller-identity)
+          ACCOUNT_ID=$(echo "$IDENTITY" | python3 -c "import sys,json; print(json.load(sys.stdin)['Account'])")
+          USER_ID=$(echo "$IDENTITY"    | python3 -c "import sys,json; print(json.load(sys.stdin)['UserId'])")
+          CALLER_ARN=$(echo "$IDENTITY" | python3 -c "import sys,json; print(json.load(sys.stdin)['Arn'])")
+          echo "::add-mask::${ACCOUNT_ID}"
+          echo "::add-mask::${USER_ID}"
+          echo "::add-mask::${CALLER_ARN}"
+          echo "::add-mask::${{ secrets.AWS_ROLE_ARN }}"
+
+          # Extract and mask role ID from USER_ID (e.g., AROAXL6U5N4RVZV3VPC7I)
+          ROLE_ID=$(echo "${USER_ID}" | cut -d: -f1)
+          [[ -n "$ROLE_ID" && "$ROLE_ID" != "$USER_ID" ]] && echo "::add-mask::${ROLE_ID}"
+
+          # Mask all VPC IDs
+          aws ec2 describe-vpcs \
+            --query 'Vpcs[].VpcId' --output text \
+            --region "${AWS_DEFAULT_REGION}" \
+          | tr '\t' '\n' | while read -r ID; do
+            [[ -n "$ID" ]] && echo "::add-mask::${ID}"
+          done
+
+          # Mask all subnet IDs
+          aws ec2 describe-subnets \
+            --query 'Subnets[].SubnetId' --output text \
+            --region "${AWS_DEFAULT_REGION}" \
+          | tr '\t' '\n' | while read -r ID; do
+            [[ -n "$ID" ]] && echo "::add-mask::${ID}"
+          done
+
+          # Mask all security group IDs
+          aws ec2 describe-security-groups \
+            --query 'SecurityGroups[].GroupId' --output text \
+            --region "${AWS_DEFAULT_REGION}" \
+          | tr '\t' '\n' | while read -r ID; do
+            [[ -n "$ID" ]] && echo "::add-mask::${ID}"
+          done
+
+          # Mask packer subnet secret if set
+          if [[ -n "${{ secrets.PACKER_SUBNET_ID }}" ]]; then
+            echo "::add-mask::${{ secrets.PACKER_SUBNET_ID }}"
+          fi
+
+      - name: Install Packer
+        run: |
+          curl -fsSL https://apt.releases.hashicorp.com/gpg \
+            | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp.gpg
+          echo "deb [signed-by=/usr/share/keyrings/hashicorp.gpg] \
+            https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/hashicorp.list
+          sudo apt-get update -q && sudo apt-get install -y packer
+
+      - name: Resolve subnet
+        id: net
+        run: |
+          SUBNET="${{ secrets.PACKER_SUBNET_ID }}"
+          if [[ -z "$SUBNET" ]]; then
+            INSTANCE_TYPE="c6i.xlarge"
+            OFFERED_AZS="$(aws ec2 describe-instance-type-offerings \
+              --location-type availability-zone \
+              --filters Name=instance-type,Values="${INSTANCE_TYPE}" \
+              --query 'InstanceTypeOfferings[].Location' \
+              --output text)"
+
+            while read -r subnet_id az available_ips; do
+              [[ -z "${subnet_id:-}" ]] && continue
+              if grep -qw "$az" <<<"$OFFERED_AZS"; then
+                SUBNET="$subnet_id"
+                echo "Selected subnet $subnet_id in $az for ${INSTANCE_TYPE} (${available_ips} free IPs)."
+                break
+              fi
+            done < <(
+              aws ec2 describe-subnets \
+                --filters \
+                  Name=state,Values=available \
+                  Name=map-public-ip-on-launch,Values=true \
+                --query 'Subnets[].{id:SubnetId,az:AvailabilityZone,ips:AvailableIpAddressCount}' \
+                --output text \
+                | sort -k3,3nr
+            )
+
+            if [[ -z "$SUBNET" ]]; then
+              SUBNET=$(aws ec2 describe-subnets \
+                --filters Name=defaultForAz,Values=true \
+                --query 'Subnets[0].SubnetId' --output text)
+              echo "No subnet matched advertised ${INSTANCE_TYPE} capacity; falling back to ${SUBNET}."
+            fi
+          fi
+          echo "subnet_id=${SUBNET}" >> "$GITHUB_OUTPUT"
+
+      - name: Packer build — x86 base
+        id: packer
+        run: |
+          set +e
+          packer init .
+          packer build \
+            -machine-readable \
+            -only=cpu-ds-ml-base.amazon-ebs.ubuntu_base \
+            -var "region=${AWS_DEFAULT_REGION}" \
+            -var "subnet_id=${{ steps.net.outputs.subnet_id }}" \
+            -var "root_volume_size=24" \
+            -var "associate_public_ip=true" \
+            . > /tmp/packer-build.raw.log 2>&1
+          status=$?
+
+          AMI_ID=$(grep ',artifact,0,id,' /tmp/packer-build.raw.log \
+            | grep -oE 'ami-[0-9a-f]{17}' | head -1)
+          if [[ -z "$AMI_ID" ]]; then
+            AMI_ID=$(aws ec2 describe-images --owners self \
+              --filters "Name=name,Values=cpu-ds-ml-ubuntu-2204-base-*" \
+              --query 'sort_by(Images, &CreationDate)[-1].ImageId' \
+              --output text --region "$AWS_DEFAULT_REGION")
+          fi
+          python3 scripts/sanitize-log.py /tmp/packer-build.raw.log /tmp/packer-build.log
+          cat /tmp/packer-build.log
+          if [[ $status -ne 0 ]]; then
+            exit $status
+          fi
+          [[ -z "$AMI_ID" || "$AMI_ID" == "None" ]] && { echo "ERROR: AMI ID not found"; exit 1; }
+          aws ec2 create-tags \
+            --resources "$AMI_ID" \
+            --region "$AWS_DEFAULT_REGION" \
+            --tags \
+              "Key=TestContractVersion,Value=${X86_BASE_TEST_CONTRACT_VERSION}" \
+              "Key=BaseRuntimeContract,Value=py311-py312-py313-pyspark-layered-wheels" \
+              "Key=SourceCommit,Value=${GITHUB_SHA}"
+          echo "Built AMI: ${AMI_ID}"
+          echo "ami_id=${AMI_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Packer log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: packer-log-x86-base
+          path: /tmp/packer-build.log
+          retention-days: 3
+
+  guard-x86-base-test-contract:
+    name: Guard x86 base test contract
+    needs: [validate, build-x86-base]
+    environment: production
+    if: |
+      always() &&
+      needs.validate.result == 'success' &&
+      github.event.inputs.direct_x86_pro_from_existing_base != 'true' &&
+      github.event.inputs.direct_x86_test_from_existing_pro != 'true' &&
+      contains(fromJSON('["base","pro"]'), github.event.inputs.target) &&
+      (
+        github.event.inputs.existing_x86_base_ami_id != '' ||
+        needs.build-x86-base.result == 'success'
+      )
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    outputs:
+      ami_id: ${{ steps.guard.outputs.ami_id }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c  # v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+          role-duration-seconds: 3600
+          audience: sts.amazonaws.com
+
+      - name: Validate x86 base AMI test contract
+        id: guard
+        run: |
+          AMI_ID="${{ github.event.inputs.existing_x86_base_ami_id }}"
+          if [[ -z "$AMI_ID" ]]; then
+            AMI_ID="${{ needs.build-x86-base.outputs.ami_id }}"
+          fi
+          [[ -z "$AMI_ID" ]] && { echo "ERROR: no AMI ID resolved for x86 base test guard"; exit 1; }
+
+          CONTRACT=$(aws ec2 describe-images \
+            --image-ids "$AMI_ID" \
+            --region "$AWS_DEFAULT_REGION" \
+            --query 'Images[0].Tags[?Key==`TestContractVersion`].Value | [0]' \
+            --output text)
+
+          if [[ "$CONTRACT" != "${X86_BASE_TEST_CONTRACT_VERSION}" ]]; then
+            echo "ERROR: AMI $AMI_ID does not satisfy the current x86 base test contract."
+            echo "Expected TestContractVersion=${X86_BASE_TEST_CONTRACT_VERSION}"
+            echo "Found TestContractVersion=${CONTRACT:-<missing>}"
+            echo "Rebuild the base AMI with the current pipeline before running the x86 base test."
+            exit 1
+          fi
+
+          echo "AMI contract verified: ${X86_BASE_TEST_CONTRACT_VERSION}"
+          echo "ami_id=${AMI_ID}" >> "$GITHUB_OUTPUT"
+
+  test-x86-base:
+    name: Test x86 base AMI
+    needs: [validate, build-x86-base, guard-x86-base-test-contract]
+    environment: production
+    if: |
+      always() &&
+      needs.validate.result == 'success' &&
+      github.event.inputs.direct_x86_pro_from_existing_base != 'true' &&
+      github.event.inputs.direct_x86_test_from_existing_pro != 'true' &&
+      needs.guard-x86-base-test-contract.result == 'success' &&
+      contains(fromJSON('["base","pro"]'), github.event.inputs.target) &&
+      (
+        github.event.inputs.existing_x86_base_ami_id != '' ||
+        needs.build-x86-base.result == 'success'
+      )
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    outputs:
+      ami_id: ${{ steps.passthrough.outputs.ami_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c  # v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+          role-duration-seconds: 7200
+          audience: sts.amazonaws.com
+
+      - name: Mask sensitive values from logs
+        run: |
+          # Mask AWS region
+          echo "::add-mask::${AWS_DEFAULT_REGION}"
+
+          IDENTITY=$(aws sts get-caller-identity)
+          ACCOUNT_ID=$(echo "$IDENTITY" | python3 -c "import sys,json; print(json.load(sys.stdin)['Account'])")
+          USER_ID=$(echo "$IDENTITY"    | python3 -c "import sys,json; print(json.load(sys.stdin)['UserId'])")
+          CALLER_ARN=$(echo "$IDENTITY" | python3 -c "import sys,json; print(json.load(sys.stdin)['Arn'])")
+          echo "::add-mask::${ACCOUNT_ID}"
+          echo "::add-mask::${USER_ID}"
+          echo "::add-mask::${CALLER_ARN}"
+          echo "::add-mask::${{ secrets.AWS_ROLE_ARN }}"
+
+          # Extract and mask role ID from USER_ID (e.g., AROAXL6U5N4RVZV3VPC7I)
+          ROLE_ID=$(echo "${USER_ID}" | cut -d: -f1)
+          [[ -n "$ROLE_ID" && "$ROLE_ID" != "$USER_ID" ]] && echo "::add-mask::${ROLE_ID}"
+
+          # Mask all VPC IDs
+          aws ec2 describe-vpcs \
+            --query 'Vpcs[].VpcId' --output text \
+            --region "${AWS_DEFAULT_REGION}" \
+          | tr '\t' '\n' | while read -r ID; do
+            [[ -n "$ID" ]] && echo "::add-mask::${ID}"
+          done
+
+          # Mask all subnet IDs
+          aws ec2 describe-subnets \
+            --query 'Subnets[].SubnetId' --output text \
+            --region "${AWS_DEFAULT_REGION}" \
+          | tr '\t' '\n' | while read -r ID; do
+            [[ -n "$ID" ]] && echo "::add-mask::${ID}"
+          done
+
+          # Mask all security group IDs
+          aws ec2 describe-security-groups \
+            --query 'SecurityGroups[].GroupId' --output text \
+            --region "${AWS_DEFAULT_REGION}" \
+          | tr '\t' '\n' | while read -r ID; do
+            [[ -n "$ID" ]] && echo "::add-mask::${ID}"
+          done
+
+          # Mask packer subnet secret if set
+          if [[ -n "${{ secrets.PACKER_SUBNET_ID }}" ]]; then
+            echo "::add-mask::${{ secrets.PACKER_SUBNET_ID }}"
+          fi
+
+      - name: Run AMI tests — x86 base
+        run: |
+          chmod +x scripts/test-ami.sh
+          AMI_ID="${{ needs.guard-x86-base-test-contract.outputs.ami_id }}"
+          scripts/test-ami.sh \
+            "${AMI_ID}" \
+            x86_64 \
+            base
+
+      - name: Upload AMI scan reports — x86 base
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: ami-scan-x86-base
+          path: /tmp/ami-scan-artifacts/x86_64-base
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Pass AMI ID to tag job
+        id: passthrough
+        run: |
+          AMI_ID="${{ needs.guard-x86-base-test-contract.outputs.ami_id }}"
+          echo "ami_id=${AMI_ID}" >> "$GITHUB_OUTPUT"
+
+# ── x86 pro ─────────────────────────────────────────────────────────────────
+  build-x86-pro:
+    name: Build x86 pro AMI
+    needs: [validate, test-x86-base, guard-x86-base-test-contract]
+    environment: production
+    if: |
+      always() &&
+      needs.validate.result == 'success' &&
+      github.event.inputs.direct_x86_test_from_existing_pro != 'true' &&
+      (inputs.target == 'pro' || github.event.inputs.target == 'pro') &&
+      (
+        (
+          github.event.inputs.direct_x86_pro_from_existing_base == 'true' &&
+          github.event.inputs.existing_x86_base_ami_id != ''
+        ) ||
+        needs.test-x86-base.result == 'success'
+      )
+    runs-on: ubuntu-22.04
+    timeout-minutes: 75
+    outputs:
+      ami_id: ${{ steps.packer.outputs.ami_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c  # v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+          role-duration-seconds: 7200
+          audience: sts.amazonaws.com
+
+      - name: Mask sensitive values from logs
+        run: |
+          # Mask AWS region
+          echo "::add-mask::${AWS_DEFAULT_REGION}"
+
+          IDENTITY=$(aws sts get-caller-identity)
+          ACCOUNT_ID=$(echo "$IDENTITY" | python3 -c "import sys,json; print(json.load(sys.stdin)['Account'])")
+          USER_ID=$(echo "$IDENTITY"    | python3 -c "import sys,json; print(json.load(sys.stdin)['UserId'])")
+          CALLER_ARN=$(echo "$IDENTITY" | python3 -c "import sys,json; print(json.load(sys.stdin)['Arn'])")
+          echo "::add-mask::${ACCOUNT_ID}"
+          echo "::add-mask::${USER_ID}"
+          echo "::add-mask::${CALLER_ARN}"
+          echo "::add-mask::${{ secrets.AWS_ROLE_ARN }}"
+
+          # Extract and mask role ID from USER_ID (e.g., AROAXL6U5N4RVZV3VPC7I)
+          ROLE_ID=$(echo "${USER_ID}" | cut -d: -f1)
+          [[ -n "$ROLE_ID" && "$ROLE_ID" != "$USER_ID" ]] && echo "::add-mask::${ROLE_ID}"
+
+          # Mask all VPC IDs
+          aws ec2 describe-vpcs \
+            --query 'Vpcs[].VpcId' --output text \
+            --region "${AWS_DEFAULT_REGION}" \
+          | tr '\t' '\n' | while read -r ID; do
+            [[ -n "$ID" ]] && echo "::add-mask::${ID}"
+          done
+
+          # Mask all subnet IDs
+          aws ec2 describe-subnets \
+            --query 'Subnets[].SubnetId' --output text \
+            --region "${AWS_DEFAULT_REGION}" \
+          | tr '\t' '\n' | while read -r ID; do
+            [[ -n "$ID" ]] && echo "::add-mask::${ID}"
+          done
+
+          # Mask all security group IDs
+          aws ec2 describe-security-groups \
+            --query 'SecurityGroups[].GroupId' --output text \
+            --region "${AWS_DEFAULT_REGION}" \
+          | tr '\t' '\n' | while read -r ID; do
+            [[ -n "$ID" ]] && echo "::add-mask::${ID}"
+          done
+
+          # Mask packer subnet secret if set
+          if [[ -n "${{ secrets.PACKER_SUBNET_ID }}" ]]; then
+            echo "::add-mask::${{ secrets.PACKER_SUBNET_ID }}"
+          fi
+
+      - name: Install Packer
+        run: |
+          curl -fsSL https://apt.releases.hashicorp.com/gpg \
+            | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp.gpg
+          echo "deb [signed-by=/usr/share/keyrings/hashicorp.gpg] \
+            https://apt.releases.hashicorp.com $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/hashicorp.list
+          sudo apt-get update -q && sudo apt-get install -y packer
+
+      - name: Resolve subnet
+        id: net
+        run: |
+          SUBNET="${{ secrets.PACKER_SUBNET_ID }}"
+          if [[ -z "$SUBNET" ]]; then
+            INSTANCE_TYPE="c6i.xlarge"
+            OFFERED_AZS="$(aws ec2 describe-instance-type-offerings \
+              --location-type availability-zone \
+              --filters Name=instance-type,Values="${INSTANCE_TYPE}" \
+              --query 'InstanceTypeOfferings[].Location' \
+              --output text)"
+
+            while read -r subnet_id az available_ips; do
+              [[ -z "${subnet_id:-}" ]] && continue
+              if grep -qw "$az" <<<"$OFFERED_AZS"; then
+                SUBNET="$subnet_id"
+                echo "Selected subnet $subnet_id in $az for ${INSTANCE_TYPE} (${available_ips} free IPs)."
+                break
+              fi
+            done < <(
+              aws ec2 describe-subnets \
+                --filters \
+                  Name=state,Values=available \
+                  Name=map-public-ip-on-launch,Values=true \
+                --query 'Subnets[].{id:SubnetId,az:AvailabilityZone,ips:AvailableIpAddressCount}' \
+                --output text \
+                | sort -k3,3nr
+            )
+
+            if [[ -z "$SUBNET" ]]; then
+              SUBNET=$(aws ec2 describe-subnets \
+                --filters Name=defaultForAz,Values=true \
+                --query 'Subnets[0].SubnetId' --output text)
+              echo "No subnet matched advertised ${INSTANCE_TYPE} capacity; falling back to ${SUBNET}."
+            fi
+          fi
+          echo "subnet_id=${SUBNET}" >> "$GITHUB_OUTPUT"
+
+      - name: Packer build — x86 pro
+        id: packer
+        run: |
+          set +e
+          BASE_AMI_ID="${{ github.event.inputs.existing_x86_base_ami_id }}"
+          if [[ "${{ github.event.inputs.direct_x86_pro_from_existing_base }}" != "true" ]]; then
+            BASE_AMI_ID="${{ needs.guard-x86-base-test-contract.outputs.ami_id }}"
+          fi
+          [[ -z "$BASE_AMI_ID" || "$BASE_AMI_ID" == "None" ]] && { echo "ERROR: base AMI ID not found"; exit 1; }
+          packer init .
+          packer build \
+            -machine-readable \
+            -only=cpu-ds-ml-pro.amazon-ebs.ubuntu_pro \
+            -var "region=${AWS_DEFAULT_REGION}" \
+            -var "subnet_id=${{ steps.net.outputs.subnet_id }}" \
+            -var "base_ami_id=${BASE_AMI_ID}" \
+            -var "root_volume_size=50" \
+            -var "associate_public_ip=true" \
+            . > /tmp/packer-build.raw.log 2>&1
+          status=$?
+
+          AMI_ID=$(grep ',artifact,0,id,' /tmp/packer-build.raw.log \
+            | grep -oE 'ami-[0-9a-f]{17}' | head -1)
+          if [[ -z "$AMI_ID" ]]; then
+            AMI_ID=$(aws ec2 describe-images --owners self \
+              --filters "Name=name,Values=cpu-ds-ml-ubuntu-2204-pro-*" \
+              --query 'sort_by(Images, &CreationDate)[-1].ImageId' \
+              --output text --region "$AWS_DEFAULT_REGION")
+          fi
+          python3 scripts/sanitize-log.py /tmp/packer-build.raw.log /tmp/packer-build.log
+          cat /tmp/packer-build.log
+          if [[ $status -ne 0 ]]; then
+            exit $status
+          fi
+          [[ -z "$AMI_ID" || "$AMI_ID" == "None" ]] && { echo "ERROR: AMI ID not found"; exit 1; }
+          echo "Built AMI: ${AMI_ID}"
+          echo "ami_id=${AMI_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Packer log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: packer-log-x86-pro
+          path: /tmp/packer-build.log
+          retention-days: 3
+
+  test-x86-pro:
+    name: Test x86 pro AMI
+    needs: [validate, build-x86-pro]
+    environment: production
+    if: |
+      always() &&
+      needs.validate.result == 'success' &&
+      github.event.inputs.target == 'pro' &&
+      (
+        (
+          github.event.inputs.direct_x86_test_from_existing_pro == 'true' &&
+          github.event.inputs.existing_x86_pro_ami_id != ''
+        ) ||
+        needs.build-x86-pro.result == 'success'
+      )
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    outputs:
+      ami_id: ${{ steps.passthrough.outputs.ami_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c  # v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+          role-duration-seconds: 7200
+          audience: sts.amazonaws.com
+
+      - name: Mask sensitive values from logs
+        run: |
+          # Mask AWS region
+          echo "::add-mask::${AWS_DEFAULT_REGION}"
+
+          IDENTITY=$(aws sts get-caller-identity)
+          ACCOUNT_ID=$(echo "$IDENTITY" | python3 -c "import sys,json; print(json.load(sys.stdin)['Account'])")
+          USER_ID=$(echo "$IDENTITY"    | python3 -c "import sys,json; print(json.load(sys.stdin)['UserId'])")
+          CALLER_ARN=$(echo "$IDENTITY" | python3 -c "import sys,json; print(json.load(sys.stdin)['Arn'])")
+          echo "::add-mask::${ACCOUNT_ID}"
+          echo "::add-mask::${USER_ID}"
+          echo "::add-mask::${CALLER_ARN}"
+          echo "::add-mask::${{ secrets.AWS_ROLE_ARN }}"
+
+          # Extract and mask role ID from USER_ID (e.g., AROAXL6U5N4RVZV3VPC7I)
+          ROLE_ID=$(echo "${USER_ID}" | cut -d: -f1)
+          [[ -n "$ROLE_ID" && "$ROLE_ID" != "$USER_ID" ]] && echo "::add-mask::${ROLE_ID}"
+
+          # Mask all VPC IDs
+          aws ec2 describe-vpcs \
+            --query 'Vpcs[].VpcId' --output text \
+            --region "${AWS_DEFAULT_REGION}" \
+          | tr '\t' '\n' | while read -r ID; do
+            [[ -n "$ID" ]] && echo "::add-mask::${ID}"
+          done
+
+          # Mask all subnet IDs
+          aws ec2 describe-subnets \
+            --query 'Subnets[].SubnetId' --output text \
+            --region "${AWS_DEFAULT_REGION}" \
+          | tr '\t' '\n' | while read -r ID; do
+            [[ -n "$ID" ]] && echo "::add-mask::${ID}"
+          done
+
+          # Mask all security group IDs
+          aws ec2 describe-security-groups \
+            --query 'SecurityGroups[].GroupId' --output text \
+            --region "${AWS_DEFAULT_REGION}" \
+          | tr '\t' '\n' | while read -r ID; do
+            [[ -n "$ID" ]] && echo "::add-mask::${ID}"
+          done
+
+          # Mask packer subnet secret if set
+          if [[ -n "${{ secrets.PACKER_SUBNET_ID }}" ]]; then
+            echo "::add-mask::${{ secrets.PACKER_SUBNET_ID }}"
+          fi
+
+      - name: Run AMI tests — x86 pro
+        run: |
+          chmod +x scripts/test-ami.sh
+          AMI_ID="${{ github.event.inputs.existing_x86_pro_ami_id }}"
+          if [[ "${{ github.event.inputs.direct_x86_test_from_existing_pro }}" != "true" ]]; then
+            AMI_ID="${{ needs.build-x86-pro.outputs.ami_id }}"
+          fi
+          scripts/test-ami.sh \
+            "${AMI_ID}" \
+            x86_64 \
+            pro
+
+      - name: Upload AMI scan reports — x86 pro
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: ami-scan-x86-pro
+          path: /tmp/ami-scan-artifacts/x86_64-pro
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Pass AMI ID to tag job
+        id: passthrough
+        run: |
+          AMI_ID="${{ github.event.inputs.existing_x86_pro_ami_id }}"
+          if [[ "${{ github.event.inputs.direct_x86_test_from_existing_pro }}" != "true" ]]; then
+            AMI_ID="${{ needs.build-x86-pro.outputs.ami_id }}"
+          fi
+          echo "ami_id=${AMI_ID}" >> "$GITHUB_OUTPUT"
+
+# ── Tag AMIs ─────────────────────────────────────────────────────────────────
+  tag-release:
+    name: Tag AMIs with release version
+    needs: [test-x86-base, test-x86-pro]
+    environment: production
+    if: |
+      always() &&
+      github.event.inputs.version_tag != '' &&
+      (needs.test-x86-base.result == 'success' || needs.test-x86-base.result == 'skipped') &&
+      (needs.test-x86-pro.result == 'success' || needs.test-x86-pro.result == 'skipped') &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c  # v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+          role-duration-seconds: 7200
+          audience: sts.amazonaws.com
+
+      - name: Mask sensitive values from logs
+        run: |
+          # Mask AWS region
+          echo "::add-mask::${AWS_DEFAULT_REGION}"
+
+          IDENTITY=$(aws sts get-caller-identity)
+          ACCOUNT_ID=$(echo "$IDENTITY" | python3 -c "import sys,json; print(json.load(sys.stdin)['Account'])")
+          USER_ID=$(echo "$IDENTITY"    | python3 -c "import sys,json; print(json.load(sys.stdin)['UserId'])")
+          CALLER_ARN=$(echo "$IDENTITY" | python3 -c "import sys,json; print(json.load(sys.stdin)['Arn'])")
+          echo "::add-mask::${ACCOUNT_ID}"
+          echo "::add-mask::${USER_ID}"
+          echo "::add-mask::${CALLER_ARN}"
+          echo "::add-mask::${{ secrets.AWS_ROLE_ARN }}"
+
+          # Extract and mask role ID from USER_ID (e.g., AROAXL6U5N4RVZV3VPC7I)
+          ROLE_ID=$(echo "${USER_ID}" | cut -d: -f1)
+          [[ -n "$ROLE_ID" && "$ROLE_ID" != "$USER_ID" ]] && echo "::add-mask::${ROLE_ID}"
+
+          # Mask all VPC IDs
+          aws ec2 describe-vpcs \
+            --query 'Vpcs[].VpcId' --output text \
+            --region "${AWS_DEFAULT_REGION}" \
+          | tr '\t' '\n' | while read -r ID; do
+            [[ -n "$ID" ]] && echo "::add-mask::${ID}"
+          done
+
+          # Mask all subnet IDs
+          aws ec2 describe-subnets \
+            --query 'Subnets[].SubnetId' --output text \
+            --region "${AWS_DEFAULT_REGION}" \
+          | tr '\t' '\n' | while read -r ID; do
+            [[ -n "$ID" ]] && echo "::add-mask::${ID}"
+          done
+
+          # Mask all security group IDs
+          aws ec2 describe-security-groups \
+            --query 'SecurityGroups[].GroupId' --output text \
+            --region "${AWS_DEFAULT_REGION}" \
+          | tr '\t' '\n' | while read -r ID; do
+            [[ -n "$ID" ]] && echo "::add-mask::${ID}"
+          done
+
+          # Mask packer subnet secret if set
+          if [[ -n "${{ secrets.PACKER_SUBNET_ID }}" ]]; then
+            echo "::add-mask::${{ secrets.PACKER_SUBNET_ID }}"
+          fi
+
+      - name: Tag all built AMIs
+        env:
+          VERSION: ${{ github.event.inputs.version_tag }}
+        run: |
+          REGION="${AWS_DEFAULT_REGION}"
+
+          tag_ami() {
+            local ami_id="$1"
+            local label="$2"
+            [[ -z "$ami_id" || "$ami_id" == "null" ]] && return 0
+            aws ec2 create-tags \
+              --resources "$ami_id" \
+              --tags \
+                "Key=Version,Value=${VERSION}" \
+                "Key=ReleasedAt,Value=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                "Key=Pipeline,Value=ami-build" \
+                "Key=Label,Value=${label}" \
+              --region "$REGION"
+            echo "Tagged ${ami_id} (${label}) with ${VERSION}"
+          }
+
+          tag_ami "${{ needs.test-x86-base.outputs.ami_id }}" "x86-base"
+          tag_ami "${{ needs.test-x86-pro.outputs.ami_id }}"  "x86-pro"
+      - name: Retire old x86 AMIs (keep latest 1 of each)
+        run: |
+          REGION="${AWS_DEFAULT_REGION}"
+
+          # Keeps only the latest AMI for each name pattern and deregisters
+          # everything older. Rebuild from scratch if a rollback is ever needed.
+          retire_old_amis() {
+            local name_filter="$1"
+
+            OLD_AMIS=$(aws ec2 describe-images \
+              --owners self \
+              --filters "Name=name,Values=${name_filter}" \
+              --query "reverse(sort_by(Images, &CreationDate))[1:].ImageId" \
+              --output text --region "$REGION")
+
+            if [[ -z "$OLD_AMIS" || "$OLD_AMIS" == "None" ]]; then
+              echo "Nothing to retire for ${name_filter}."
+              return 0
+            fi
+
+            for AMI_ID in $OLD_AMIS; do
+              SNAPS=$(aws ec2 describe-images --image-ids "$AMI_ID" \
+                --query 'Images[].BlockDeviceMappings[].Ebs.SnapshotId' \
+                --output text --region "$REGION")
+              aws ec2 deregister-image --image-id "$AMI_ID" --region "$REGION"
+              echo "Retired: $AMI_ID (${name_filter})"
+              for SNAP in $SNAPS; do
+                aws ec2 delete-snapshot --snapshot-id "$SNAP" --region "$REGION" \
+                  && echo "  Deleted snapshot: $SNAP"
+              done
+            done
+          }
+
+          retire_old_amis "cpu-ds-ml-ubuntu-2204-base-*"
+          retire_old_amis "cpu-ds-ml-ubuntu-2204-pro-*"
+
+# ── Safety-net cleanup ───────────────────────────────────────────────────────
+# Runs unconditionally after every pipeline execution — success, failure, or
+# cancellation. Terminates any EC2 instances tagged Purpose=ami-ci-test that
+# are still running, guarding against the case where the bash trap in
+# test-ami.sh was skipped due to a SIGKILL from a job timeout.
+  cleanup-orphans:
+    name: Terminate orphaned test instances
+    needs: [test-x86-base, test-x86-pro]
+    if: |
+      always() &&
+      (
+        needs.test-x86-base.result != 'skipped' ||
+        needs.test-x86-pro.result != 'skipped'
+      )
+    runs-on: ubuntu-22.04
+    environment: production
+    timeout-minutes: 10
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@ff717079ee2060e4bcee96c4779b553acc87447c  # v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_DEFAULT_REGION }}
+          role-duration-seconds: 7200
+          audience: sts.amazonaws.com
+
+      - name: Mask sensitive values from logs
+        run: |
+          # Mask AWS region
+          echo "::add-mask::${AWS_DEFAULT_REGION}"
+
+          IDENTITY=$(aws sts get-caller-identity)
+          ACCOUNT_ID=$(echo "$IDENTITY" | python3 -c "import sys,json; print(json.load(sys.stdin)['Account'])")
+          USER_ID=$(echo "$IDENTITY"    | python3 -c "import sys,json; print(json.load(sys.stdin)['UserId'])")
+          CALLER_ARN=$(echo "$IDENTITY" | python3 -c "import sys,json; print(json.load(sys.stdin)['Arn'])")
+          echo "::add-mask::${ACCOUNT_ID}"
+          echo "::add-mask::${USER_ID}"
+          echo "::add-mask::${CALLER_ARN}"
+          echo "::add-mask::${{ secrets.AWS_ROLE_ARN }}"
+
+          # Extract and mask role ID from USER_ID (e.g., AROAXL6U5N4RVZV3VPC7I)
+          ROLE_ID=$(echo "${USER_ID}" | cut -d: -f1)
+          [[ -n "$ROLE_ID" && "$ROLE_ID" != "$USER_ID" ]] && echo "::add-mask::${ROLE_ID}"
+
+          # Mask all VPC IDs
+          aws ec2 describe-vpcs \
+            --query 'Vpcs[].VpcId' --output text \
+            --region "${AWS_DEFAULT_REGION}" \
+          | tr '\t' '\n' | while read -r ID; do
+            [[ -n "$ID" ]] && echo "::add-mask::${ID}"
+          done
+
+          # Mask all subnet IDs
+          aws ec2 describe-subnets \
+            --query 'Subnets[].SubnetId' --output text \
+            --region "${AWS_DEFAULT_REGION}" \
+          | tr '\t' '\n' | while read -r ID; do
+            [[ -n "$ID" ]] && echo "::add-mask::${ID}"
+          done
+
+          # Mask all security group IDs
+          aws ec2 describe-security-groups \
+            --query 'SecurityGroups[].GroupId' --output text \
+            --region "${AWS_DEFAULT_REGION}" \
+          | tr '\t' '\n' | while read -r ID; do
+            [[ -n "$ID" ]] && echo "::add-mask::${ID}"
+          done
+
+          # Mask packer subnet secret if set
+          if [[ -n "${{ secrets.PACKER_SUBNET_ID }}" ]]; then
+            echo "::add-mask::${{ secrets.PACKER_SUBNET_ID }}"
+          fi
+
+      - name: Terminate orphaned test instances
+        run: |
+          REGION="${AWS_DEFAULT_REGION}"
+          INSTANCE_IDS=$(aws ec2 describe-instances \
+            --filters \
+              "Name=tag:Purpose,Values=ami-ci-test" \
+              "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query 'Reservations[].Instances[].InstanceId' \
+            --output text --region "$REGION")
+
+          if [[ -z "$INSTANCE_IDS" || "$INSTANCE_IDS" == "None" ]]; then
+            echo "No orphaned test instances."
+          else
+            echo "Terminating: $INSTANCE_IDS"
+            # shellcheck disable=SC2086
+            aws ec2 terminate-instances --instance-ids $INSTANCE_IDS \
+              --region "$REGION" \
+              --query 'TerminatingInstances[].{ID:InstanceId,State:CurrentState.Name}' \
+              --output table
+          fi
+
+      - name: Delete orphaned key pairs
+        run: |
+          REGION="${AWS_DEFAULT_REGION}"
+          KEY_NAMES=$(aws ec2 describe-key-pairs \
+            --filters "Name=key-name,Values=ami-test-*" \
+            --query 'KeyPairs[].KeyName' --output text --region "$REGION")
+
+          if [[ -z "$KEY_NAMES" || "$KEY_NAMES" == "None" ]]; then
+            echo "No orphaned key pairs."
+          else
+            for KN in $KEY_NAMES; do
+              aws ec2 delete-key-pair --key-name "$KN" --region "$REGION"
+              echo "Deleted key pair: $KN"
+            done
+          fi
+
+      - name: Delete orphaned security groups
+        run: |
+          REGION="${AWS_DEFAULT_REGION}"
+          SG_IDS=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=ami-test-*" \
+            --query 'SecurityGroups[].GroupId' --output text --region "$REGION")
+
+          if [[ -z "$SG_IDS" || "$SG_IDS" == "None" ]]; then
+            echo "No orphaned security groups."
+          else
+            for SG in $SG_IDS; do
+              # Skip if still attached to an instance (instance termination may be in-flight)
+              IN_USE=$(aws ec2 describe-instances \
+                --filters "Name=instance.group-id,Values=${SG}" \
+                          "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+                --query 'Reservations[].Instances[].InstanceId' \
+                --output text --region "$REGION")
+              if [[ -n "$IN_USE" && "$IN_USE" != "None" ]]; then
+                echo "Skipping $SG — still attached to $IN_USE"
+              else
+                aws ec2 delete-security-group --group-id "$SG" --region "$REGION" \
+                  2>/dev/null && echo "Deleted SG: $SG" || echo "Could not delete $SG (may need retry)"
+              fi
+            done
+          fi
+
+      - name: Delete orphaned EBS snapshots from failed Packer builds
+        run: |
+          REGION="${AWS_DEFAULT_REGION}"
+
+          # Snapshots created by Packer have "Created by CreateImage" or
+          # "Copied for SourceAMI" in their description. Orphaned ones exist
+          # when a Packer build crashed after snapshotting but before registering
+          # the AMI — so the snapshot has no associated registered AMI.
+
+          # All snapshot IDs currently backing a registered AMI
+          REGISTERED=$(aws ec2 describe-images \
+            --owners self \
+            --query 'Images[].BlockDeviceMappings[].Ebs.SnapshotId' \
+            --output text --region "$REGION")
+
+          # All self-owned snapshots with Packer-style descriptions
+          PACKER_SNAPS=$(aws ec2 describe-snapshots \
+            --owner-ids self \
+            --filters "Name=description,Values=*Packer*,*CreateImage*" \
+            --query 'Snapshots[?StartTime<=`'"$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)"'`].SnapshotId' \
+            --output text --region "$REGION")
+
+          if [[ -z "$PACKER_SNAPS" || "$PACKER_SNAPS" == "None" ]]; then
+            echo "No candidate orphaned snapshots."
+            exit 0
+          fi
+
+          DELETED=0
+          for SNAP in $PACKER_SNAPS; do
+            if echo "$REGISTERED" | grep -qw "$SNAP"; then
+              echo "Skipping $SNAP — backing a registered AMI"
+            else
+              aws ec2 delete-snapshot --snapshot-id "$SNAP" --region "$REGION" \
+                && echo "Deleted orphaned snapshot: $SNAP" && DELETED=$((DELETED+1)) \
+                || echo "Could not delete $SNAP (may be in use)"
+            fi
+          done
+          echo "Deleted $DELETED orphaned snapshot(s)."
+
+      - name: Trigger OpenSCAP compliance report
+        if: |
+          needs.build-x86-base.result == 'success' &&
+          needs.test-x86-base.result == 'success' &&
+          (
+            needs.build-x86-pro.result == 'success' ||
+            needs.build-x86-pro.result == 'skipped'
+          ) &&
+          (
+            needs.test-x86-pro.result == 'success' ||
+            needs.test-x86-pro.result == 'skipped'
+          )
+        run: |
+          echo "✅ All AMI builds and tests successful!"
+          echo ""
+          echo "Triggering build-openscap-x86.yml for compliance reporting..."
+          gh workflow run build-openscap-x86.yml \
+            --ref ${{ github.ref }}
+          echo ""
+          echo "Track progress at: https://github.com/${{ github.repository }}/actions/workflows/build-openscap-x86.yml"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

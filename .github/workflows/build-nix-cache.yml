@@ -1,0 +1,142 @@
+name: Build Cache (x86_64)
+
+on:
+  schedule:
+    # Monthly rebuild: 1st of month at 2am UTC
+    - cron: '0 2 1 * *'
+  workflow_dispatch:
+
+concurrency:
+  group: build-nix-cache-main
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build-nix-cache-x86:
+    if: github.ref == 'refs/heads/main' && github.actor != 'dependabot[bot]'
+    name: Build Nix cache x86_64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Mask sensitive values
+        run: |
+          echo "::add-mask::${{ github.repository }}"
+          echo "::add-mask::${{ github.workspace }}"
+
+      - name: Install Nix (x86_64 only)
+        uses: cachix/install-nix-action@v30
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+          extra_nix_config: |
+            extra-experimental-features = nix-command flakes
+            system = x86_64-linux
+
+      - name: Setup Cachix (binary cache)
+        uses: cachix/cachix-action@v15
+        with:
+          name: cpu-ds-ml
+          authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+        continue-on-error: true
+
+      - name: Build Python 3.11 cache environment
+        run: |
+          set +e
+          nix build --extra-experimental-features nix-command --extra-experimental-features flakes \
+            --max-jobs auto --cores 0 \
+            -o /tmp/py-cache-base \
+            ./nix#py-cache-base --print-build-logs > /tmp/py-cache-base.raw.log 2>&1
+          status=$?
+          python3 scripts/sanitize-log.py /tmp/py-cache-base.raw.log /tmp/py-cache-base.log
+          cat /tmp/py-cache-base.log
+          exit $status
+
+      - name: Build Python 3.12 cache environment
+        run: |
+          set +e
+          nix build --extra-experimental-features nix-command --extra-experimental-features flakes \
+            --max-jobs auto --cores 0 \
+            -o /tmp/py-cache-base-py312 \
+            ./nix#py-cache-base-py312 --print-build-logs > /tmp/py-cache-base-py312.raw.log 2>&1
+          status=$?
+          python3 scripts/sanitize-log.py /tmp/py-cache-base-py312.raw.log /tmp/py-cache-base-py312.log
+          cat /tmp/py-cache-base-py312.log
+          exit $status
+
+      - name: Build Python 3.13 cache environment
+        run: |
+          set +e
+          nix build --extra-experimental-features nix-command --extra-experimental-features flakes \
+            --max-jobs auto --cores 0 \
+            -o /tmp/py-cache-base-py313 \
+            ./nix#py-cache-base-py313 --print-build-logs > /tmp/py-cache-base-py313.raw.log 2>&1
+          status=$?
+          python3 scripts/sanitize-log.py /tmp/py-cache-base-py313.raw.log /tmp/py-cache-base-py313.log
+          cat /tmp/py-cache-base-py313.log
+          exit $status
+
+      - name: Build language toolchains (parallel)
+        run: |
+          set +e
+          nix build --extra-experimental-features nix-command --extra-experimental-features flakes \
+            --max-jobs auto --cores 0 \
+            ./nix#python313 ./nix#julia ./nix#R ./nix#go ./nix#java ./nix#spark \
+            ./nix#rustc ./nix#cargo ./nix#nodejs --print-build-logs > /tmp/langs.raw.log 2>&1
+          status=$?
+          python3 scripts/sanitize-log.py /tmp/langs.raw.log /tmp/langs.log
+          cat /tmp/langs.log
+          exit $status
+
+      - name: Smoke test Python cache environments
+        run: |
+          /tmp/py-cache-base/bin/python -c "import IPython, pyspark; print('py311 cache ok')"
+          /tmp/py-cache-base-py312/bin/python -c "import IPython, pyspark; print('py312 cache ok')"
+          /tmp/py-cache-base-py313/bin/python -c "import IPython, pyspark; print('py313 cache ok')"
+
+      - name: Smoke test language toolchains
+        run: |
+          nix run ./nix#python313 -- --version
+          nix run ./nix#julia -- -e 'println(VERSION)'
+          nix run ./nix#R -- --version | head -1
+          nix run ./nix#go -- version
+          nix run ./nix#java -- -version
+          nix run ./nix#rustc -- --version
+          nix run ./nix#cargo -- --version
+          nix run ./nix#nodejs -- --version
+
+      - name: Push to Cachix
+        if: always()
+        run: |
+          echo "To push to Cachix, run:"
+          echo "  nix flake show"
+          echo "  cachix push cpu-ds-ml ./result"
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nix-build-logs-x86
+          path: |
+            /tmp/py-cache-base.log
+            /tmp/py-cache-base-py312.log
+            /tmp/py-cache-base-py313.log
+            /tmp/langs.log
+          retention-days: 3
+
+      - name: Notify on completion
+        if: always()
+        run: |
+          echo ""
+          echo "════════════════════════════════════════════════════════════════"
+          echo "✅ Nix cache build complete (x86_64)"
+          echo "════════════════════════════════════════════════════════════════"
+          echo ""
+          echo "Cache uploaded to: https://cpu-ds-ml.cachix.org"
+          echo "AMI trigger step is currently disabled for this workflow."
+          echo "════════════════════════════════════════════════════════════════"

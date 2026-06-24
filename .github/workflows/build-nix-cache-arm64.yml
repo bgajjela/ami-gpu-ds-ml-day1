@@ -1,0 +1,137 @@
+name: Build Cache (aarch64)
+
+on:
+  schedule:
+    # Monthly rebuild: 1st of month at 3am UTC (1hr after x86 to avoid resource contention)
+    - cron: '0 3 1 * *'
+  workflow_dispatch:
+
+concurrency:
+  group: build-nix-cache-arm64-main
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build-nix-cache-arm64:
+    if: github.ref == 'refs/heads/main' && github.actor != 'dependabot[bot]'
+    name: Build Nix cache aarch64 (QEMU cross-compile)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Mask sensitive values
+        run: |
+          echo "::add-mask::${{ github.repository }}"
+          echo "::add-mask::${{ github.workspace }}"
+
+      - name: Install QEMU for aarch64 emulation
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y qemu-user-static binfmt-support
+          sudo update-binfmts --enable qemu-aarch64
+          echo "✅ QEMU aarch64 emulation enabled"
+          file /usr/bin/qemu-aarch64-static
+
+      - name: Install Nix with aarch64 cross-compile support
+        uses: cachix/install-nix-action@v30
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+          extra_nix_config: |
+            extra-experimental-features = nix-command flakes
+            extra-platforms = aarch64-linux
+            extra-sandbox-paths = /usr/bin/qemu-aarch64-static
+
+      - name: Register aarch64 binfmt with Nix daemon
+        run: |
+          echo "extra-platforms = aarch64-linux" | sudo tee -a /etc/nix/nix.conf
+          echo "extra-sandbox-paths = /usr/bin/qemu-aarch64-static" | sudo tee -a /etc/nix/nix.conf
+          sudo systemctl restart nix-daemon
+          echo "✅ aarch64 registered with Nix"
+
+      - name: Setup Cachix (binary cache)
+        uses: cachix/cachix-action@v15
+        with:
+          name: cpu-ds-ml
+          authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+        continue-on-error: true
+
+      - name: Build Python 3.11 cache environment (aarch64)
+        run: |
+          set +e
+          nix build --extra-experimental-features "nix-command flakes" \
+            --system aarch64-linux \
+            --max-jobs auto --cores 0 \
+            -o /tmp/py-cache-base-arm64 \
+            ./nix#py-cache-base --print-build-logs > /tmp/py-cache-base-arm64.raw.log 2>&1
+          status=$?
+          python3 scripts/sanitize-log.py /tmp/py-cache-base-arm64.raw.log /tmp/py-cache-base-arm64.log
+          cat /tmp/py-cache-base-arm64.log
+          exit $status
+
+      - name: Build Python 3.12 cache environment (aarch64)
+        run: |
+          set +e
+          nix build --extra-experimental-features "nix-command flakes" \
+            --system aarch64-linux \
+            --max-jobs auto --cores 0 \
+            -o /tmp/py-cache-base-py312-arm64 \
+            ./nix#py-cache-base-py312 --print-build-logs > /tmp/py-cache-base-py312-arm64.raw.log 2>&1
+          status=$?
+          python3 scripts/sanitize-log.py /tmp/py-cache-base-py312-arm64.raw.log /tmp/py-cache-base-py312-arm64.log
+          cat /tmp/py-cache-base-py312-arm64.log
+          exit $status
+
+      - name: Build Python 3.13 cache environment (aarch64)
+        run: |
+          set +e
+          nix build --extra-experimental-features "nix-command flakes" \
+            --system aarch64-linux \
+            --max-jobs auto --cores 0 \
+            -o /tmp/py-cache-base-py313-arm64 \
+            ./nix#py-cache-base-py313 --print-build-logs > /tmp/py-cache-base-py313-arm64.raw.log 2>&1
+          status=$?
+          python3 scripts/sanitize-log.py /tmp/py-cache-base-py313-arm64.raw.log /tmp/py-cache-base-py313-arm64.log
+          cat /tmp/py-cache-base-py313-arm64.log
+          exit $status
+
+      - name: Build language toolchains (aarch64 parallel)
+        run: |
+          set +e
+          nix build --extra-experimental-features "nix-command flakes" \
+            --system aarch64-linux \
+            --max-jobs auto --cores 0 \
+            ./nix#python313 ./nix#julia ./nix#R ./nix#go ./nix#java ./nix#spark \
+            ./nix#rustc ./nix#cargo ./nix#nodejs \
+            --print-build-logs > /tmp/langs-arm64.raw.log 2>&1
+          status=$?
+          python3 scripts/sanitize-log.py /tmp/langs-arm64.raw.log /tmp/langs-arm64.log
+          cat /tmp/langs-arm64.log
+          exit $status
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nix-build-logs-arm64
+          path: |
+            /tmp/py-cache-base-arm64.log
+            /tmp/py-cache-base-py312-arm64.log
+            /tmp/py-cache-base-py313-arm64.log
+            /tmp/langs-arm64.log
+          retention-days: 3
+
+      - name: Notify on completion
+        if: always()
+        run: |
+          echo ""
+          echo "════════════════════════════════════════════════════════════════"
+          echo "✅ Nix cache build complete (aarch64)"
+          echo "════════════════════════════════════════════════════════════════"
+          echo "Cache uploaded to: https://cpu-ds-ml.cachix.org"
+          echo "════════════════════════════════════════════════════════════════"
