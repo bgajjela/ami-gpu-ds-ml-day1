@@ -1,43 +1,58 @@
-# CPU DS/ML AMI (Ubuntu 22.04) — Hardened + Nix Managed
+# GPU DS/ML AMI (Ubuntu 22.04) — CUDA 12.8, Hardened + Nix Managed
 
-[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/bgajjela/aws-amis-ml/badge)](https://securityscorecards.dev/viewer/?uri=github.com/bgajjela/aws-amis-ml)
-[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/12885/badge)](https://www.bestpractices.dev/projects/12885)
-[![CI](https://github.com/bgajjela/aws-amis-ml/actions/workflows/ci.yml/badge.svg)](https://github.com/bgajjela/aws-amis-ml/actions/workflows/ci.yml)
+[![GPU AMI Build & Test (x86)](https://github.com/bgajjela/ami-gpu-ds-ml-day1/actions/workflows/ami-build-gpu-x86.yml/badge.svg)](https://github.com/bgajjela/ami-gpu-ds-ml-day1/actions/workflows/ami-build-gpu-x86.yml)
 
-CIS-aligned Ubuntu 22.04 AMI for CPU-based data science and ML workloads.
-Reproducible language environments via Nix. Built for AWS Marketplace.
-Available for **x86_64** (Intel/AMD, c6i family) and **ARM64/Graviton** (c7g family).
+CIS-aligned Ubuntu 22.04 AMI for **NVIDIA GPU** data science and ML workloads.
+NVIDIA driver + CUDA 12.8, GPU-enabled PyTorch / TensorFlow, reproducible language
+environments via Nix. Built for AWS Marketplace (paid, hourly software fee).
+Available for **x86_64** (g4dn / NVIDIA T4) and **ARM64/Graviton** (g5g / NVIDIA T4G).
+
+> GPU variant of the CPU project [bgajjela/aws-amis-ml](https://github.com/bgajjela/aws-amis-ml).
+> It reuses the same Nix + CIS-hardening base→pro foundation and layers the GPU stack on top.
+
+## The GPU software chain
+
+Driver, CUDA, and the PyTorch wheel index are a **locked chain** — if any one drifts,
+the GPU silently falls back to CPU or fails to load. All four values live in one file,
+[`gpu/versions.env`](gpu/versions.env); edit it and rebuild to upgrade.
+
+| Layer | Pinned to | Notes |
+|---|---|---|
+| NVIDIA driver | `570` branch (`cuda-drivers-570`, held) | supports CUDA 12.8 |
+| CUDA toolkit | `12.8` (`cuda-toolkit-12-8`, held) | `nvcc` + dev libs |
+| PyTorch | `cu128` wheel index | the **only** source of aarch64 CUDA torch wheels (2.8+) |
+| cuDNN / cuBLAS | bundled as pip deps of torch | not installed system-wide |
 
 ## Highlights
 
 **Runtimes — all accessible without Nix commands, in any shell context**
 - Python 3.11 / 3.12 / 3.13 → `py311`, `py312`, `py313`
-- Java 21 LTS (OpenJDK/Temurin) → `java`
-- Apache Spark → `spark-submit`, `pyspark`, `pyspark311`, `pyspark312`, `pyspark313`
+- Java 21 LTS, Apache Spark (`spark-submit`, `pyspark`, `pyspark311/312/313`)
 - Julia, R/Rscript, Go, Rust/Cargo, Node.js/npm
+- CUDA toolkit on `PATH` → `nvcc`, `nvidia-smi`
 - All commands are wrapper scripts or symlinks in `/usr/local/bin` — work in scripts, cron, SSH non-interactive, Jupyter kernels, and systemd services
 
-**Pro AMI adds** (layers on base, ~22 min extra)
-- PyTorch (CPU), TensorFlow CPU, Transformers, Datasets, Tokenizers, Accelerate
-- XGBoost, LightGBM, MLflow — across all three Python versions
-- ML kernel tuning: BBR TCP, 128 MB socket buffers, THP madvise, nofile=1M, vm.swappiness=1
-- Curated and smoke-tested build intended to accelerate common CPU-based DS/ML workflows; customers should validate package compatibility, runtime behavior, and performance for their own workloads before production use
-- If a packaged component fails in a clean, unmodified AMI and the issue is reproducible using the documented runtime paths or curated smoke-tested stack, remediation may be provided through best-effort guidance or a future AMI update
+**Pro AMI adds** (layers on base)
+- **PyTorch with CUDA** (`cu128`), Transformers, Datasets, Tokenizers, Accelerate
+- **TensorFlow GPU on x86** (`tensorflow[and-cuda]`); **TensorFlow CPU on ARM64** — there is no official aarch64 TF GPU wheel, and shipping a community build is avoided for a paid product
+- XGBoost (GPU hist), LightGBM, MLflow — across all three Python versions
+- GPU tuning: persistence mode, expandable-segments allocator, lazy CUDA module loading — plus the inherited CPU/data-loading tuning (BBR, THP madvise, NVMe scheduler, `nofile=1M`)
+- Curated and smoke-tested build intended to accelerate common GPU DS/ML workflows; customers should validate package compatibility, runtime behavior, and performance for their own workloads before production use
 
-**Security — CIS-aligned Ubuntu 22.04 hardening controls applied; OpenSCAP and Trivy scan support available on demand**
+**Security — CIS-aligned Ubuntu 22.04 hardening controls applied; OpenSCAP and Trivy scan support on demand**
+- GPU stack installed **before** hardening so CIS module/sysctl lockdown does not interfere with driver loading; `nouveau` blacklisted, `nvidia` modules loaded at boot
 - SSH: key-only, no root, chacha20/aes-gcm, login banner
-- Network controls: nftables enabled; SSH access restricted and rate-limited via fail2ban
-- Filesystem: `/tmp` + `/var/tmp` tmpfs (nosuid/nodev/noexec, size=25%/10% RAM); `/dev/shm` hardened
-- Logging: auditd (640 MB cap, rotated); journald (500 MB cap, 2-week retention, compressed)
-- IMDSv2 enforced; EBS encrypted at rest (KMS); AppArmor enabled; AIDE included
-- Boot footprint: multipathd, fwupd, snapd, apport, iscsid, motd-news disabled — saves ~5–8s per boot
-- On-demand scanner: `sudo ami-scan` (Trivy CVE + OpenSCAP CIS) — no boot hooks, no auto-run
+- Network controls: UFW (nftables backend) default-deny; SSH rate-limited via fail2ban
+- Filesystem: `/tmp` + `/var/tmp` tmpfs (nosuid/nodev/noexec); `/dev/shm` hardened
+- Logging: auditd (640 MB cap, rotated); journald (500 MB cap, compressed)
+- IMDSv2 enforced; AppArmor enabled; AIDE included
+- On-demand scanner: `sudo ami-scan` (Trivy CVE + OpenSCAP CIS) — no boot hooks
 
 **Architectures**
-- x86_64 — `c6i.xlarge` (Intel, 4 vCPU / 8 GB) · AMI names: `cpu-ds-ml-ubuntu-2204-{base|pro}-<ts>`
-- ARM64/Graviton3 — `c7g.xlarge` (4 vCPU / 8 GB) · AMI names: `cpu-ds-ml-ubuntu-2204-arm64-{base|pro}-<ts>`
-- Both architectures share identical scripts: same CIS-aligned hardening, same tuning, same smoke tests
-- ARM64 PyTorch installed from PyPI (first-class `linux_aarch64` wheels); x86 from WHL index
+- x86_64 — `g4dn.xlarge` (NVIDIA T4, 4 vCPU / 16 GB) · AMI names: `gpu-ds-ml-ubuntu-2204-{base|pro}-<ts>`
+- ARM64/Graviton — `g5g.xlarge` (NVIDIA T4G, 4 vCPU / 8 GB) · AMI names: `gpu-ds-ml-ubuntu-2204-arm64-{base|pro}-<ts>`
+- Both share identical scripts: same CUDA install, same CIS hardening, same tuning, same GPU smoke tests
+- PyTorch CUDA wheels come from the `cu128` index on **both** architectures
 
 **Compliance**
 - CIS-aligned Ubuntu 22.04 hardening controls applied; OpenSCAP scan support and CycloneDX SBOM included
@@ -49,168 +64,97 @@ Available for **x86_64** (Intel/AMD, c6i family) and **ARM64/Graviton** (c7g fam
 ## Build Architecture
 
 ```
-                   C P U  ·  D S / M L  ·  A M I   B u i l d   P i p e l i n e
+                 G P U  ·  D S / M L  ·  A M I   B u i l d   P i p e l i n e
   ═══════════════════════════════════════════════════════════════════════════════
 
   ╔══════════════════════════════════════════════════════════════════════════╗
-  ║  ▶  BASE AMI  ·  packer build -only=cpu-ds-ml-base  ·  ~20–24 min      ║
+  ║  ▶  BASE AMI  ·  -only=gpu-ds-ml-x86-base  ·  on g4dn.xlarge (T4)        ║
   ╠══════════════════════════════════════════════════════════════════════════╣
   ║                                                                          ║
-  ║   SOURCE  ──  Ubuntu 22.04 LTS  (Canonical  ·  ami-0*jammy-amd64)      ║
+  ║   SOURCE  ──  Ubuntu 22.04 LTS  (Canonical  ·  stock jammy image)      ║
   ║                           │                                              ║
-  ║   ┌───────────────────────▼────────────────────────────────┐  ~5 min   ║
-  ║   │  1  APT BOOTSTRAP                                       │░          ║
-  ║   │  ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄  │░          ║
-  ║   │  curl · jq · git-lfs · unzip · gnupg · build-essential │░          ║
-  ║   │  nftables · auditd · fail2ban · unattended-upgrades    │░          ║
-  ║   │  libopenscap8 + Ubuntu SSG content · trivy v0.70.0     │░          ║
-  ║   │  awscli v2  (PGP-verified)  ·  Nix 2.24.9 (pinned)     │░          ║
-  ║   └────────────────────────────────────────────────────────┘░          ║
-  ║    ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░           ║
+  ║   ┌───────────────────────▼────────────────────────────────┐           ║
+  ║   │  1  APT BOOTSTRAP  +  KERNEL REBOOT                     │           ║
+  ║   │  apt upgrade → reboot into final kernel (DKMS target)   │           ║
+  ║   │  curl · jq · build-essential · nftables · auditd        │           ║
+  ║   │  fail2ban · trivy · awscli v2 (PGP) · Nix 2.24.9        │           ║
+  ║   └────────────────────────────────────────────────────────┘           ║
   ║                           │                                              ║
-  ║   ┌───────────────────────▼────────────────────────────────┐  ~4 min   ║
-  ║   │  2  CIS HARDENING  (harden.sh)                         │░          ║
-  ║   │  ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄  │░          ║
-  ║   │  ┌─────────────────────┐  ┌─────────────────────────┐  │░          ║
-  ║   │  │  §1-2  Filesystem   │  │  §3    Network          │  │░          ║
-  ║   │  │  tmpfs · modules    │  │  sysctl · nftables · BBR│  │░          ║
-  ║   │  │  AIDE  · AppArmor   │  │  martians · SYN cookies │  │░          ║
-  ║   │  └─────────────────────┘  └─────────────────────────┘  │░          ║
-  ║   │  ┌─────────────────────┐  ┌─────────────────────────┐  │░          ║
-  ║   │  │  §4    Logging      │  │  §5    Access           │  │░          ║
-  ║   │  │  auditd  (640 MB)   │  │  SSH · PAM · faillock   │  │░          ║
-  ║   │  │  logrotate+maxsize  │  │  sudo · password aging  │  │░          ║
-  ║   │  │  journald+keepfree  │  │  TMOUT · wheel group    │  │░          ║
-  ║   │  └─────────────────────┘  └─────────────────────────┘  │░          ║
-  ║   │  service audit: multipathd · fwupd · snapd · iscsid     │░          ║
-  ║   │  apport · motd-news disabled · timesyncd enabled        │░          ║
-  ║   │        CIS-aligned controls  ·  verify with ami-scan    │░          ║
-  ║   └────────────────────────────────────────────────────────┘░          ║
-  ║    ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░           ║
+  ║   ┌───────────────────────▼────────────────────────────────┐  GPU      ║
+  ║   │  2  CUDA INSTALL  (install-cuda.sh)  +  REBOOT          │  ★★★      ║
+  ║   │  ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄  │           ║
+  ║   │  NVIDIA driver 570 + cuda-toolkit-12-8  (apt, pinned)   │           ║
+  ║   │  blacklist nouveau · DKMS build · modules-load.d/nvidia │           ║
+  ║   │  apt-mark hold · CUDA on PATH via /etc/profile.d        │           ║
+  ║   │  reboot → nouveau unloads, nvidia binds → verify        │           ║
+  ║   │                       nvidia-smi  ·  nvcc --version      │           ║
+  ║   └────────────────────────────────────────────────────────┘           ║
   ║                           │                                              ║
-  ║   ┌───────────────────────▼────────────────────────────────┐  ~8 min   ║
-  ║   │  3  PARALLEL NIX BUILDS  (build-base-envs.sh)          │░          ║
-  ║   │  ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄  │░          ║
-  ║   │                                                         │░          ║
-  ║   │   py-base (3.11) ──────────────────────────────┐       │░          ║
-  ║   │   py-base-py312  ──────────────────────────────┤       │░          ║
-  ║   │   py-base-py313  ──────────────────────────────┤       │░          ║
-  ║   │   julia          ──────────────────────────────┤ wait  │░          ║
-  ║   │   R              ──────────────────────────────┤  all  │░          ║
-  ║   │   go             ──────────────────────────────┤  12   │░          ║
-  ║   │   java 21 LTS    ──────────────────────────────┤       │░          ║
-  ║   │   spark          ──────────────────────────────┤       │░          ║
-  ║   │   rustc · cargo  ──────────────────────────────┤       │░          ║
-  ║   │   nodejs 22 LTS  ──────────────────────────────┘       │░          ║
-  ║   │                                                         │░          ║
-  ║   │   all 12 fire simultaneously  ·  cache.nixos.org        │░          ║
-  ║   │   download-bound  ·  fail-fast per job                  │░          ║
-  ║   │                                                         │░          ║
-  ║   │   → /opt/nix/envs/{base,base-py312,base-py313}         │░          ║
-  ║   │   → /opt/nix/langs/{java,spark,julia,R,go,rustc,...}   │░          ║
-  ║   │   → /usr/local/bin/{py311,py312,py313,java,go,...}     │░          ║
-  ║   │   → /usr/local/bin/{pyspark,pyspark311/312/313,        │░          ║
-  ║   │                      spark-submit}  (wrapper scripts)   │░          ║
-  ║   └────────────────────────────────────────────────────────┘░          ║
-  ║    ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░           ║
+  ║   ┌───────────────────────▼────────────────────────────────┐           ║
+  ║   │  3  PARALLEL NIX BUILDS  (build-base-envs.sh)          │           ║
+  ║   │  py311/312/313 · julia · R · go · java · spark · ...    │           ║
+  ║   │  12 builds, Cachix-backed (cpu-ds-ml.cachix.org)        │           ║
+  ║   │  → /usr/local/bin/{py311,py312,py313,spark-submit,...}  │           ║
+  ║   └────────────────────────────────────────────────────────┘           ║
   ║                           │                                              ║
-  ║   ┌───────────────────────▼────────────────────────────────┐  ~1 min   ║
-  ║   │  4  AMI FINALIZE  (ami-finalize.sh)                     │░          ║
-  ║   │  ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄  │░          ║
-  ║   │  packages.txt  ·  CycloneDX SBOM  ·  EULA (AWS SC)    │░          ║
-  ║   │  EAR-classification.txt  ·  MOTD                        │░          ║
-  ║   │  nix GC  ·  pip/apt/trivy cache purge                   │░          ║
-  ║   │  SSH host keys  ·  cloud-init clean  ·  machine-id      │░          ║
-  ║   └────────────────────────────────────────────────────────┘░          ║
-  ║    ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░           ║
+  ║   ┌───────────────────────▼────────────────────────────────┐           ║
+  ║   │  4  CIS HARDENING  (harden.sh)  — runs AFTER CUDA       │           ║
+  ║   │  filesystem · network · logging · access · service audit│           ║
+  ║   │  module blacklist does NOT touch nvidia · re-verify GPU │           ║
+  ║   └────────────────────────────────────────────────────────┘           ║
   ║                           │                                              ║
+  ║   ┌───────────────────────▼────────────────────────────────┐           ║
+  ║   │  5  AMI FINALIZE  ·  SBOM · EULA · EAR · scrub          │           ║
+  ║   └────────────────────────────────────────────────────────┘           ║
   ║               ╔═══════════▼══════════════════════╗                      ║
-  ║               ║  ◆  BASE AMI                     ║                      ║
-  ║               ║  cpu-ds-ml-ubuntu-2204-base-<ts> ║                      ║
-  ║               ║  tagged  Role=dsml               ║                      ║
+  ║               ║  ◆  gpu-ds-ml-ubuntu-2204-base-<ts>  Role=dsml-gpu ║   ║
   ║               ╚══════════════════════════════════╝                      ║
   ╚══════════════════════════════════════════════════════════════════════════╝
 
-                           │
-                           │  data "amazon-ami" "base"
-                           │  auto-discovers latest BASE AMI  ·  no duplication
-                           │  of apt / hardening / Nix work  (~1.5h saved)
-                           │
+                           │  source_ami = GPU base AMI (driver+CUDA+Nix+hardened)
+                           │  no repeat of apt / CUDA / hardening / Nix work
+                           ▼
   ╔══════════════════════════════════════════════════════════════════════════╗
-  ║  ▶  PRO AMI   ·  packer build -only=cpu-ds-ml-pro   ·  ~22–27 min      ║
+  ║  ▶  PRO AMI   ·  -only=gpu-ds-ml-x86-pro   ·  on g4dn.xlarge (T4)       ║
   ╠══════════════════════════════════════════════════════════════════════════╣
-  ║                                                                          ║
-  ║   SOURCE  ──  BASE AMI  (hardened  ·  Nix envs intact  ·  all tools)   ║
-  ║                           │                                              ║
-  ║   ┌───────────────────────▼────────────────────────────────┐  ~18 min  ║
-  ║   │  1  PARALLEL PIP INSTALLS  (build-pro-envs.sh)         │░          ║
-  ║   │  ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄  │░          ║
-  ║   │                                                         │░          ║
-  ║   │   py311 ─► venv (--system-site-packages) ──────────┐  │░          ║
-  ║   │   py312 ─► venv (--system-site-packages) ──────────┤  │░          ║
-  ║   │   py313 ─► venv (--system-site-packages) ──────────┘  │░          ║
-  ║   │              3 pip jobs fire simultaneously             │░          ║
-  ║   │                                                         │░          ║
-  ║   │   Each env installs:                                    │░          ║
-  ║   │   ├─ torch · torchvision · torchaudio  (CPU ~200 MB)   │░          ║
-  ║   │   ├─ tensorflow-cpu                    (CPU ~600 MB)   │░          ║
-  ║   │   ├─ transformers · datasets · tokenizers · accelerate │░          ║
-  ║   │   └─ mlflow · xgboost · lightgbm                       │░          ║
-  ║   │                                                         │░          ║
-  ║   │   inherits base: numpy · pandas · pyspark · sklearn    │░          ║
-  ║   │   → /opt/nix/envs/{pro,pro-py312,pro-py313}            │░          ║
-  ║   │   → pyspark311/312/313 wrappers updated to pro envs    │░          ║
-  ║   └────────────────────────────────────────────────────────┘░          ║
-  ║    ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░           ║
-  ║                           │                                              ║
-  ║   ┌───────────────────────▼────────────────────────────────┐  ~1 min   ║
-  ║   │  2  ML PERFORMANCE TUNING  (tune-pro.sh)                │░          ║
-  ║   │  ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄  │░          ║
-  ║   │  vm.swappiness=1  ·  vfs_cache_pressure=50             │░          ║
-  ║   │  TCP BBR+fq  ·  128 MB socket buffers  ·  inotify 512K │░          ║
-  ║   │  THP madvise (systemd oneshot at boot)                  │░          ║
-  ║   │  nofile=1M  ·  nproc=65536  ·  memlock=unlimited        │░          ║
-  ║   │  NVMe scheduler=none  ·  OMP/OpenBLAS/MKL threads=nproc │░          ║
-  ║   └────────────────────────────────────────────────────────┘░          ║
-  ║    ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░           ║
-  ║                           │                                              ║
-  ║   ┌───────────────────────▼────────────────────────────────┐  ~1 min   ║
-  ║   │  3  COMPUTE SMOKE TESTS  (smoke-pro.sh)                 │░          ║
-  ║   │  ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄  │░          ║
-  ║   │  torch matmul + autograd  ·  tf matmul                  │░          ║
-  ║   │  XGBoost/LightGBM fit  ·  PySpark session + agg        │░          ║
-  ║   │  transformers tokenizer round-trip                       │░          ║
-  ║   │  runs py311 · py312 · py313  ·  aborts build on fail    │░          ║
-  ║   └────────────────────────────────────────────────────────┘░          ║
-  ║    ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░           ║
-  ║                           │                                              ║
-  ║   ┌───────────────────────▼────────────────────────────────┐  ~1 min   ║
-  ║   │  4  AMI FINALIZE  (ami-finalize.sh)                     │░          ║
-  ║   │  packages.txt (all 3 envs)  ·  SBOM  ·  EULA  ·  scrub │░          ║
-  ║   └────────────────────────────────────────────────────────┘░          ║
-  ║    ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░           ║
-  ║                           │                                              ║
+  ║   ┌────────────────────────────────────────────────────────┐           ║
+  ║   │  1  PARALLEL PIP INSTALLS  (build-gpu-envs.sh)         │           ║
+  ║   │  py311/312/313 → venv (--system-site-packages)         │           ║
+  ║   │  ├─ torch · torchvision · torchaudio   (cu128 index)   │           ║
+  ║   │  ├─ tensorflow[and-cuda]  (x86)  /  tensorflow-cpu (arm)│           ║
+  ║   │  ├─ transformers · datasets · tokenizers · accelerate  │           ║
+  ║   │  └─ mlflow · xgboost · lightgbm                        │           ║
+  ║   │  inherits base: numpy · pandas · pyspark · sklearn     │           ║
+  ║   └────────────────────────────────────────────────────────┘           ║
+  ║   ┌────────────────────────────────────────────────────────┐           ║
+  ║   │  2  TUNING  ·  tune-pro.sh  then  tune-gpu.sh           │           ║
+  ║   │  CPU/data tuning + persistence mode, expandable_segments│           ║
+  ║   │  lazy CUDA module loading, TF allow-growth              │           ║
+  ║   └────────────────────────────────────────────────────────┘           ║
+  ║   ┌────────────────────────────────────────────────────────┐           ║
+  ║   │  3  GPU SMOKE TESTS  (smoke-gpu.sh)                     │           ║
+  ║   │  nvidia-smi · torch CUDA matmul+autograd ON GPU         │           ║
+  ║   │  tf GPU matmul (x86) · xgboost GPU · pyspark · all 3 py │           ║
+  ║   │  ASSERTS cuda is live — aborts build on CPU fallback    │           ║
+  ║   └────────────────────────────────────────────────────────┘           ║
+  ║   ┌────────────────────────────────────────────────────────┐           ║
+  ║   │  4  AMI FINALIZE  ·  packages.txt · SBOM · scrub        │           ║
+  ║   └────────────────────────────────────────────────────────┘           ║
   ║               ╔═══════════▼══════════════════════╗                      ║
-  ║               ║  ◆  PRO AMI                      ║                      ║
-  ║               ║  cpu-ds-ml-ubuntu-2204-pro-<ts>  ║                      ║
-  ║               ║  tagged  Role=dsml               ║                      ║
+  ║               ║  ◆  gpu-ds-ml-ubuntu-2204-pro-<ts>   Role=dsml-gpu ║   ║
   ║               ╚══════════════════════════════════╝                      ║
   ╚══════════════════════════════════════════════════════════════════════════╝
 
   ┌──────────────────────────────────────────────────────────────────────────────┐
-  │  Build Summary  ·  Spot pricing (~70% savings)                               │
-  ├──────────────────────────┬────────────────────┬────────────┬─────────────────┤
-  │  AMI                     │  Instance          │  Time      │  Cost at Spot   │
-  ├──────────────────────────┼────────────────────┼────────────┼─────────────────┤
-  │  x86 Base                │  c6i.xlarge        │  ~20–24min │  ~$0.024        │
-  │  x86 Pro (after base)    │  c6i.xlarge        │  ~22–27min │  ~$0.027        │
-  ├──────────────────────────┼────────────────────┼────────────┼─────────────────┤
-  │  ARM64 Base              │  c7g.xlarge        │  ~22–28min │  ~$0.016        │
-  │  ARM64 Pro (after base)  │  c7g.xlarge        │  ~24–30min │  ~$0.018        │
-  ├──────────────────────────┴────────────────────┴────────────┴─────────────────┤
-  │  Boot time (RunInstances → SSH ready): ~20–30s on both architectures         │
-  │  ARM64 Spot is ~35% cheaper than x86 Spot at equivalent vCPU/RAM spec        │
-  │  On-demand scan: sudo ami-scan  ·  results → /var/log/ami-scan/              │
+  │  Build hosts (cheapest compatible — the AMI runs on any larger GPU instance)  │
+  ├──────────────────────────┬────────────────────┬──────────────────────────────┤
+  │  AMI                     │  Build instance    │  On-demand (us-east-1, approx)│
+  ├──────────────────────────┼────────────────────┼──────────────────────────────┤
+  │  x86 base / pro          │  g4dn.xlarge (T4)  │  ~$0.53/hr                    │
+  │  ARM64 base / pro        │  g5g.xlarge (T4G)  │  ~$0.42/hr                    │
+  ├──────────────────────────┴────────────────────┴──────────────────────────────┤
+  │  Root volume bumped to 80 GB (CUDA toolkit + cuDNN + CUDA wheels are large)   │
+  │  Use spot_price="auto" to cut build cost significantly                        │
   └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -218,90 +162,34 @@ Available for **x86_64** (Intel/AMD, c6i family) and **ARM64/Graviton** (c7g fam
 
 ## CI/CD Pipeline (GitHub Actions)
 
-All builds are automated via GitHub Actions. Manual local builds (see [Building](#building) section) are supported but the primary workflow uses a 3-stage cascade:
+Each architecture has its own workflow:
+[`ami-build-gpu-x86.yml`](.github/workflows/ami-build-gpu-x86.yml) and
+[`ami-build-gpu-arm64.yml`](.github/workflows/ami-build-gpu-arm64.yml).
+
+The GitHub runner stays CPU (`ubuntu-22.04`) and only orchestrates — **Packer launches
+a real GPU instance** as the build host, and `test-ami.sh` launches a real GPU instance
+to test, so all GPU work happens on EC2, never on the runner.
 
 ```
-                    C I / C D   P I P E L I N E
-  ════════════════════════════════════════════════════════════════
-
-  1. CI Validation (ci.yml)
-     ├─ 7 pre-build checks run before expensive EC2 launch:
-     │  ├─ Docker provisioning simulation (harden.sh, build scripts)
-     │  ├─ Base Ubuntu AMI validation (region availability)
-     │  ├─ AWS account health check (OIDC, instance capacity)
-     │  ├─ Nix flake.lock validation (nixpkgs ref, recency)
-     │  ├─ AMI naming conflict check
-     │  ├─ Build cost estimation (~$5–6 per run breakdown)
-     │  └─ Advanced script linting (hardcoded secrets, insecure patterns)
-     │
-     └─ On success → triggers stage 2
-
-  2. Build Cache (build-nix-cache.yml, x86_64 only)
-     ├─ Builds 12 parallel Nix packages:
-     │  ├─ Python 3.11/3.12/3.13 base environments
-     │  └─ Language toolchains (Julia, R, Go, Java, Spark, Rust, Node.js)
-     │
-     ├─ Pushes binaries to Cachix (cpu-ds-ml.cachix.org)
-     │  └─ Avoids recompilation in stage 3
-     │
-     └─ On success → triggers stage 3
-
-  3. AMI Build & Test (ami-build.yml)
-     ├─ Builds base AMI (uses cached packages, ~20–24 min)
-     │  └─ Layers on cached base → builds pro AMI (~22–27 min)
-     │
-     ├─ Runs smoke tests on both variants
-     ├─ Requires approval gates (manual confirmation for release)
-     │
-     └─ On success → uploads CVE and CIS scan artifacts from the AMI tests
-
-  ════════════════════════════════════════════════════════════════
+  validate ─► build-base ─► guard-contract ─► test-base ─► build-pro ─► test-pro ─► tag-release
+     │            (Packer on GPU instance)     (test-ami.sh on GPU instance, GPU_AMI=1)
+     └────────────────────────────────────────────────────────────────► cleanup-orphans (always)
 ```
 
-**Key Optimizations:**
+- **OIDC, no static keys** — assumes `AWS_ROLE_ARN`; logs scrub account/VPC/subnet/SG IDs (`sanitize-log.py`).
+- **Test contract guard** — base AMI must carry the current `TestContractVersion` tag before pro builds on it.
+- **GPU verification** — `test-ami.sh` (with `GPU_AMI=1`) runs `nvidia-smi` and, on pro, asserts `torch.cuda.is_available()` and a real GPU matmul on a freshly launched instance.
+- **Cachix** — the Nix base layer reuses the existing `cpu-ds-ml.cachix.org` cache (Python envs + toolchains are identical to the CPU AMIs).
 
-- **Cachix Binary Cache:** Nix packages pre-built and cached. AMI build fetches binaries instead of recompiling—cuts ~2 hours of compilation time down to ~10–15 min.
-- **Parallel Builds:** 12 simultaneous Nix builds in stage 2; 3 parallel pip installs in pro AMI stage 3.
-- **Fail-Fast Validation:** 7 cheap validation checks in stage 1 detect 95% of issues before EC2 is launched.
-- **Autonomous Repair:** If a build fails due to package test incompatibility, `scripts/autonomous-cache-monitor.sh` automatically:
-  - Detects the failure
-  - Identifies the failing package
-  - Applies a Nix overlay to skip tests
-  - Commits and pushes the fix
-  - Retriggers the cache build (up to 10 attempts or 5-hour timeout)
-
-**Triggering Builds:**
-
-Manual trigger via GitHub UI:
-1. Go to [Actions → ci.yml](https://github.com/bgajjela/aws-amis-ml/actions/workflows/ci.yml)
-2. Click "Run workflow" → choose branch
-3. Watch cascade: ci → cache → ami-build
-
-Or via CLI:
+Trigger via CLI:
 ```bash
-# Trigger ci.yml validation
-gh workflow run ci.yml --ref main
+# x86 base, then base→pro
+gh workflow run ami-build-gpu-x86.yml --ref main -f target=base
+gh workflow run ami-build-gpu-x86.yml --ref main -f target=pro
 
-# Trigger cache build directly (skip ci.yml)
-gh workflow run build-nix-cache.yml --ref main
-
-# Trigger AMI build directly (assumes cache is ready)
-gh workflow run ami-build.yml --ref main --field target=base --field region=us-east-1
+# ARM64 (phase 2)
+gh workflow run ami-build-gpu-arm64.yml --ref main -f target=pro
 ```
-
-**Monitoring & Fixing:**
-
-During sleep/offline, the autonomous monitor handles failures:
-```bash
-cd /path/to/repo
-bash scripts/autonomous-cache-monitor.sh
-```
-
-This script:
-- Polls cache build status every 5 min
-- On failure: reads logs, identifies package, adds test skip, commits, retriggers
-- Stops on success or 5-hour timeout
-- Can run in background (nohup, tmux, screen, or systemd service)
 
 ---
 
@@ -309,206 +197,157 @@ This script:
 
 ```
 .
-├── packer.pkr.hcl          Packer template — base + pro builds for x86 and ARM64
-├── harden.sh               CIS-aligned hardening controls, service audit
+├── packer-gpu.pkr.hcl       GPU Packer template — base+pro for x86 and ARM64
+├── packer.pkr.hcl           Shared CPU template (home of the reused variables)
+├── gpu/
+│   └── versions.env         ★ single source of truth: driver/CUDA/torch pins
+├── harden.sh                CIS-aligned hardening controls (shared, unchanged)
 ├── nix/
-│   └── flake.nix           Nix flake — Python envs + toolchains (nixos-25.05)
+│   └── flake.nix            Nix flake — Python envs + toolchains (shared)
 ├── scripts/
-│   ├── build-base-envs.sh  12 parallel Nix builds + wrapper scripts in /usr/local/bin
-│   ├── build-pro-envs.sh   3 parallel pip installs + pro pyspark wrapper updates
-│   ├── tune-pro.sh         ML kernel/network/limits tuning (pro only)
-│   ├── smoke-pro.sh        Compute-level smoke tests — torch/tf/xgb/spark/tokenizers
-│   ├── ami-scan.sh         On-demand CVE (Trivy) + CIS (OpenSCAP) scanner
-│   ├── ami-finalize.sh     Manifest, SBOM, EULA, EAR notice, GC, AMI scrub
-│   └── spark-java.sh       /etc/profile.d — JAVA_HOME/SPARK_HOME for login shells
-├── examples/
-│   └── spark/              pyspark_basic.py, pyspark_pi.py
-├── tests/
-│   └── cis-check.sh        Static CIS compliance check (CI gate)
-├── legal/
-│   ├── ATTRIBUTIONS.tpl.md Per-package OSS license table
-│   ├── NOTICE.tpl.md       OSS notice template
-│   ├── EAR-classification.md  ECCN 5D002.c.1 self-classification + BIS filing guide
-│   └── product-long.md     (see listing/)
-├── listing/
-│   ├── product-long.md     AWS Marketplace product description
-│   └── quickstart.md       Marketplace quick-start guide
-├── USAGE.md                Runtime usage and quick commands
-├── SECURITY_REPORT.md      Hardening controls and verification steps
-└── Makefile                validate · fmt · test (shellcheck + CIS check)
+│   ├── install-cuda.sh      NVIDIA driver + CUDA toolkit (arch-aware) — GPU only
+│   ├── build-gpu-envs.sh    CUDA torch/tf pip layering (GPU twin of build-pro-envs.sh)
+│   ├── tune-gpu.sh          GPU tuning: persistence, allocator, lazy loading
+│   ├── smoke-gpu.sh         GPU compute smoke tests (asserts CUDA is live)
+│   ├── build-base-envs.sh   12 parallel Nix builds + /usr/local/bin wrappers (shared)
+│   ├── tune-pro.sh          CPU/data-loading tuning (shared, runs before tune-gpu)
+│   ├── test-ami.sh          launch/verify/teardown — GPU-aware via GPU_AMI + TEST_INSTANCE_TYPE
+│   ├── ami-scan.sh          on-demand CVE (Trivy) + CIS (OpenSCAP) scanner (shared)
+│   └── ami-finalize.sh      manifest, SBOM, EULA, EAR notice, GC, scrub (shared)
+├── .github/workflows/
+│   ├── ami-build-gpu-x86.yml    GPU x86 build/test/tag pipeline
+│   └── ami-build-gpu-arm64.yml  GPU ARM64 build/test/tag pipeline
+├── examples/ · legal/ · listing/ · tests/   (shared)
+└── README.md
 ```
 
 ---
 
 ## Building
 
-**Prerequisites:** Packer with amazon plugin, AWS credentials.
+**Prerequisites:** Packer with the amazon plugin, AWS credentials, GPU instance quota.
 
 ```bash
 packer init .
-packer validate .
-packer inspect .
+packer validate \
+  -var gpu_base_ami_id=ami-00000000000000000 \
+  -var gpu_base_ami_id_arm=ami-00000000000000000 .
 ```
 
-**x86_64 (Intel/AMD — c6i family):**
+**x86_64 (g4dn / NVIDIA T4):**
 ```bash
-# Build base first, then pro (pro layers on top of base)
-packer build -only=cpu-ds-ml-base .
-packer build -only=cpu-ds-ml-pro .
+# Base first, then pro (pro layers on the base AMI)
+packer build -only=gpu-ds-ml-x86-base.amazon-ebs.gpu_x86_base \
+  -var "subnet_id=subnet-xxx" -var "root_volume_size=80" .
 
-# Or via Makefile
-make build-base
-make build-pro
+packer build -only=gpu-ds-ml-x86-pro.amazon-ebs.gpu_x86_pro \
+  -var "gpu_base_ami_id=ami-xxx" -var "subnet_id=subnet-xxx" -var "root_volume_size=80" .
 ```
 
-**ARM64/Graviton (c7g family):**
+**ARM64/Graviton (g5g / NVIDIA T4G):**
 ```bash
-# Same flow — base first, then pro
-packer build -only=cpu-ds-ml-arm64-base .
-packer build -only=cpu-ds-ml-arm64-pro .
+packer build -only=gpu-ds-ml-arm64-base.amazon-ebs.gpu_arm_base \
+  -var "subnet_id=subnet-xxx" -var "root_volume_size=80" .
 
-# Or via Makefile
-make build-arm-base
-make build-arm-pro
+packer build -only=gpu-ds-ml-arm64-pro.amazon-ebs.gpu_arm_pro \
+  -var "gpu_base_ami_id_arm=ami-xxx" -var "subnet_id=subnet-xxx" -var "root_volume_size=80" .
 ```
 
-**Variables** (`vars.example.pkrvars.hcl` → copy to `vars.pkrvars.hcl`):
+**GPU variables** (reuses the shared `region`, `spot_price`, `subnet_id`, etc.):
 
 | Variable | Default | Notes |
 |---|---|---|
-| `instance_type` | `c6i.xlarge` | x86 build instance; `c6i.2xlarge` for ~30% faster builds |
-| `arm_instance_type` | `c7g.xlarge` | ARM64 build instance; `c7g.2xlarge` for faster builds |
-| `spot_price` | `""` | Set `"auto"` to cut build cost ~70% on both arches |
-| `root_volume_size` | `24` | GB; increase for large pip caches |
-| `encrypt_ebs` | `true` | EBS encryption at rest |
-| `kms_key_id` | `""` | CMK ARN; empty = AWS-managed key |
-| `additional_regions` | `[]` | List of regions to copy AMI into after build |
+| `gpu_instance_type` | `g4dn.xlarge` | x86 GPU build host (NVIDIA T4) |
+| `gpu_arm_instance_type` | `g5g.xlarge` | ARM64 GPU build host (NVIDIA T4G) |
+| `gpu_base_ami_id` | `""` | x86 base AMI the pro build layers on |
+| `gpu_base_ami_id_arm` | `""` | ARM64 base AMI the pro build layers on |
+| `root_volume_size` | `24` | **set to 80** for GPU builds (CUDA + cuDNN + wheels) |
+| `spot_price` | `""` | set `"auto"` to cut build cost |
+
+**Upgrading CUDA later:** edit the four pins in [`gpu/versions.env`](gpu/versions.env)
+(driver branch, CUDA series, torch index) and rebuild. No other file hard-codes a version.
 
 ---
 
 ## Runtime Usage
 
-All commands work without sourcing any profile or running Nix commands:
-
 ```bash
-# Python
-py311 -V && py312 -V && py313 -V
+# GPU
+nvidia-smi
+nvcc --version
+
+# Python + GPU PyTorch
+py311 -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 
 # Other toolchains
-julia -e 'println(VERSION)'
-R --version && go version && rustc --version && node --version
-
-# Spark
+julia -e 'println(VERSION)'; R --version; go version; node --version
 spark-submit --version
-java -version
 ```
 
-**PySpark — version-pinned wrappers** (base AMI uses base envs; pro AMI uses pro envs):
-```bash
-pyspark311       # Python 3.11 + full base/pro env
-pyspark312       # Python 3.12
-pyspark313       # Python 3.13
-pyspark          # default (py311 env)
-
-# Override interpreter for bare pyspark:
-PYSPARK_PYTHON=/opt/nix/envs/base-py312/bin/python pyspark
-```
-
-These wrappers embed `JAVA_HOME`, `SPARK_HOME`, `SPARK_LOCAL_DIRS`, and `PYSPARK_PYTHON` — they work correctly in scripts, cron, SSH non-interactive sessions, and Jupyter kernels without any setup.
+**PySpark wrappers** (`pyspark311/312/313`, `pyspark`) embed `JAVA_HOME`, `SPARK_HOME`,
+`SPARK_LOCAL_DIRS`, `PYSPARK_PYTHON` — they work in scripts, cron, SSH non-interactive,
+and Jupyter kernels with no setup.
 
 **On-demand security scan:**
 ```bash
-sudo ami-scan              # CVE (Trivy) + CIS (OpenSCAP)  ~5–8 min
-sudo ami-scan --cve        # CVE only  ~2–3 min
-sudo ami-scan --cis        # CIS only (default profile)  ~3–5 min
-sudo ami-scan --cis-level1 # CIS Ubuntu 22.04 Level 1 profile
+sudo ami-scan              # CVE (Trivy) + CIS (OpenSCAP)
+sudo ami-scan --cve        # CVE only
 sudo ami-scan --cis-level2 # CIS Ubuntu 22.04 Level 2 profile
-sudo ami-scan --json       # machine-readable output
-sudo ami-scan --out /tmp/scan   # write results to custom dir
-# Results and symlinks to latest: /var/log/ami-scan/
+# Results: /var/log/ami-scan/
 ```
 
 **Build artifacts on each instance:**
 ```bash
-cat /usr/share/BUILD_INFO               # AMI version
-cat /usr/share/BUILD_INFO/packages.txt  # all pip + dpkg packages
-cat /usr/share/BUILD_INFO/sbom.cyclonedx.json   # CycloneDX SBOM
-cat /usr/share/BUILD_INFO/EULA.txt              # license terms
-cat /usr/share/BUILD_INFO/EAR-classification.txt # export classification
+cat /usr/share/BUILD_INFO/version              # e.g. 1.0.0-GPU-PRO
+cat /usr/share/BUILD_INFO/packages.txt         # all pip + dpkg packages
+cat /usr/share/BUILD_INFO/sbom.cyclonedx.json  # CycloneDX SBOM
 ```
 
 ---
 
-## Security Notes
+## Pro AMI — GPU Performance Profile
 
-- **AIDE:** Package and configuration are included. Validate database state on the current instance if you rely on AIDE operationally.
-- **nftables:** Firewall policy is managed with `nftables`. Review the active ruleset with `sudo nft list ruleset` and adjust it for your deployment as needed.
-- **auditd:** Logs rotate at 32 MB, 20 files max (640 MB cap). Check with `sudo ausearch -k <key>`.
-- **ami-scan:** Not run at boot or on a schedule — invoke manually when you need a current CVE or CIS report.
-- **Boot services:** `multipathd`, `fwupd`, `snapd`, `apport`, `iscsid`, and `motd-news` are disabled or masked to reduce boot footprint. `systemd-timesyncd` remains enabled for baseline time synchronization.
-- **IMDSv2:** Required on all instances. The `http_put_response_hop_limit = 1` blocks container-to-host metadata theft.
+Applied by `tune-pro.sh` + `tune-gpu.sh` at build time; active on every boot:
+
+| Area | Setting | Effect |
+|---|---|---|
+| GPU | `nvidia-persistenced` + persistence-mode service | no multi-second driver re-init between processes |
+| GPU | `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` | less fragmentation / OOM on long runs |
+| GPU | `CUDA_MODULE_LOADING=LAZY` | faster process start, lower GPU memory footprint |
+| GPU | `TF_FORCE_GPU_ALLOW_GROWTH=true` | TF shares the GPU instead of grabbing all VRAM |
+| Memory | `vm.swappiness=1`, THP `madvise` | tensors stay in RAM; TLB benefit without compaction spikes |
+| Network | BBR + fq, 128 MB buffers | faster S3 dataset ingestion |
+| Limits | `nofile=1M`, `memlock=unlimited` | DataLoader workers + pinned CUDA buffers |
+| Storage | NVMe `scheduler=none` | no software queue overhead on Nitro NVMe |
+
+---
+
+## Notes & Caveats
+
+- **TensorFlow on ARM64 is CPU-only** — no official aarch64 TF GPU wheel exists. PyTorch is GPU-enabled on both architectures.
+- **nouveau** is blacklisted and the driver is `apt-mark hold`-ed so unattended upgrades can't break the driver↔CUDA↔torch chain.
+- **torch + `tensorflow[and-cuda]`** share one venv (same pattern as the CPU AMIs); they each pull `nvidia-*-cu12` pip deps — the smoke test catches any version conflict at build time.
+- GPU instances are billed by the hour; build on the cheapest compatible host — the resulting AMI runs on any larger GPU instance the customer chooses.
 
 ---
 
 ## Support
 
 For AWS Marketplace product questions or reproducible issues affecting a clean,
-unmodified deployment of this AMI, contact `bgajjela@gmail.com`.
-
-Please include:
-- AWS account ID
-- AWS Region
-- product or version name
-- instance type
-- a short description of the issue and reproduction steps
-
-Support is limited to the packaged AMI and documented runtime paths. It does
-not include customer-modified environments, customer-installed packages,
-arbitrary third-party dependency combinations, or workload-specific
-compatibility and performance issues.
-
----
-
-## Pro AMI — Performance Profile
-
-Applied by `tune-pro.sh` at build time; active on every boot:
-
-| Area | Setting | Effect |
-|---|---|---|
-| Memory | `vm.swappiness=1` | Tensors stay in RAM; no swap to EBS |
-| Memory | `vm.vfs_cache_pressure=50` | DataLoader inode cache stays hot |
-| Memory | THP `madvise` (systemd oneshot) | PyTorch/TF tensor TLB benefit; no compaction spikes |
-| Network | BBR + fq, 128 MB buffers | S3 ingestion ~10–12 Gbps vs ~4–6 Gbps baseline |
-| Limits | `nofile=1M`, `nproc=65536` | Spark executors + DataLoader workers don't hit fd limits |
-| Limits | `memlock=unlimited` | Large embedding tables; future GPU pinned memory |
-| Storage | NVMe `scheduler=none` (udev) | Removes software queue overhead on Nitro NVMe |
-| Threading | `OMP/OpenBLAS/MKL=nproc` | Prevents thread storms from bare NumPy scripts |
-| Spark | `SPARK_LOCAL_DIRS=/opt/spark-local` | Shuffle on EBS, not tmpfs (noexec + size-capped) |
-
----
-
-## Customization
-
-- **Add packages:** extend `nix/flake.nix` with additional Nix attrs or pip deps
-- **Harden further:** edit `harden.sh`; re-run `make test` to verify CIS compliance
-- **Examples:** add scripts under `/usr/share/examples/`
-- **Multi-region:** set `additional_regions = ["us-west-2", "eu-west-1"]` in vars
+unmodified deployment of this AMI, contact `bgajjela@gmail.com` with AWS account ID,
+region, product/version, instance type, and reproduction steps. Support is limited to
+the packaged AMI and documented runtime paths.
 
 ---
 
 ## License and Compliance
 
-This AMI is licensed under the **AWS Standard Contract for AWS Marketplace**.
-Full terms: <https://aws.amazon.com/marketplace/pp/prodview-standard-contract>
-
-Open-source components (PyTorch, TensorFlow, Spark, Ubuntu packages, Nix derivations)
-remain under their respective upstream licenses. See:
+Licensed under the **AWS Standard Contract for AWS Marketplace**.
+Open-source components (PyTorch, TensorFlow, CUDA runtime libraries, Spark, Ubuntu
+packages, Nix derivations) remain under their respective upstream licenses. NVIDIA
+driver and CUDA components are subject to the NVIDIA CUDA Toolkit EULA. See:
 - `legal/ATTRIBUTIONS.tpl.md` — per-package license table
-- `legal/NOTICE.tpl.md` — OSS notice
 - `legal/EAR-classification.md` — ECCN 5D002.c.1 self-classification record
 
-On each running instance:
-- `/usr/share/BUILD_INFO/packages.txt` — full package list
-- `/usr/share/BUILD_INFO/sbom.cyclonedx.json` — CycloneDX SBOM
-- `/usr/share/OSS_NOTICES.md` — OSS attributions
-- `/usr/share/BUILD_INFO/EAR-classification.txt` — export classification notice
+On each running instance: `/usr/share/BUILD_INFO/packages.txt`,
+`/usr/share/BUILD_INFO/sbom.cyclonedx.json`, `/usr/share/OSS_NOTICES.md`.
