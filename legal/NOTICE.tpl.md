@@ -1,13 +1,16 @@
 # OSS Notices
 
-This AMI bundles open-source software installed via Ubuntu and Nix. All such
-components remain under their respective upstream licenses. This distribution
-provides integration, configuration, and support services only.
+This AMI bundles open-source software installed via Ubuntu and Nix, plus the
+NVIDIA driver and CUDA toolkit. Open-source components remain under their
+respective upstream licenses; NVIDIA components are under the NVIDIA CUDA Toolkit
+EULA. This distribution provides integration, configuration, and support services only.
 
 ## Sources
 
 - Ubuntu 22.04 LTS (Canonical) — apt archive packages
+- NVIDIA driver (570) + CUDA 12.8 — developer.download.nvidia.com (NVIDIA CUDA Toolkit EULA)
 - Nixpkgs nixos-25.05 channel — Python runtimes and ML libraries
+- PyTorch CUDA wheels (cu128) — download.pytorch.org (bundle NVIDIA CUDA runtime/cuDNN)
 - AWS CLI v2 — AWS official installer (Apache 2.0)
 
 ## On a running instance

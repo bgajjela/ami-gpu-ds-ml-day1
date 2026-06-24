@@ -5,7 +5,7 @@
 **Do not open a public GitHub issue for security vulnerabilities.**
 
 Email: bgajjela@gmail.com
-Subject line: `[SECURITY] CPU DS/ML AMI — <brief description>`
+Subject line: `[SECURITY] GPU DS/ML AMI — <brief description>`
 
 Include:
 - CVE ID if one exists
@@ -26,8 +26,9 @@ remediation timeline within **7 business days**.
 | Previous version (n-1) | Security patches only |
 | Older versions | End of life — upgrade recommended |
 
-AMI builds are timestamped in the name: `cpu-ds-ml-ubuntu-2204-{base|pro}-<timestamp>`.
-Check `/usr/share/BUILD_INFO` on a running instance for the exact build date.
+AMI builds are timestamped in the name: `gpu-ds-ml-ubuntu-2204-{base|pro}-<timestamp>`
+(and `gpu-ds-ml-ubuntu-2204-arm64-{base|pro}-<timestamp>` for Graviton).
+Check `/usr/share/BUILD_INFO/version` on a running instance for the exact build.
 
 ---
 

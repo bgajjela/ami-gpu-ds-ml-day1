@@ -2,24 +2,53 @@
 
 **Result: CIS-aligned hardening controls applied; validate the current AMI with `sudo ami-scan` for current OpenSCAP and Trivy results**
 
-Applied by: `harden.sh` (base AMI), `tune-pro.sh` (Pro AMI additional tuning)  
+Applied by: `install-cuda.sh` (GPU driver/CUDA), `harden.sh` (base AMI),
+`tune-pro.sh` + `tune-gpu.sh` (Pro AMI additional tuning)  
 Verified by: `sudo ami-scan` (Trivy + OpenSCAP, available on every instance)
 
 ## Architectures Covered
 
-This report applies equally to both published AMI families:
+This report applies equally to both published GPU AMI families:
 
-| Architecture | Instance family | AMI name pattern |
-|---|---|---|
-| x86\_64 (Intel/AMD) | c6i | `cpu-ds-ml-ubuntu-2204-{base\|pro}-<timestamp>` |
-| ARM64 / Graviton3 | c7g | `cpu-ds-ml-ubuntu-2204-arm64-{base\|pro}-<timestamp>` |
+| Architecture | Instance family | GPU | AMI name pattern |
+|---|---|---|---|
+| x86\_64 (Intel/AMD) | g4dn | NVIDIA T4 | `gpu-ds-ml-ubuntu-2204-{base\|pro}-<timestamp>` |
+| ARM64 / Graviton | g5g | NVIDIA T4G | `gpu-ds-ml-ubuntu-2204-arm64-{base\|pro}-<timestamp>` |
 
-Both architectures are built from **the same hardening and environment scripts**: `harden.sh`, `tune-pro.sh`,
-`build-base-envs.sh`, `build-pro-envs.sh`, `smoke-pro.sh`, and `ami-finalize.sh`.
-The only build-time difference is the AWS CLI download URL (`aarch64` vs `x86_64`)
-and the Ubuntu source AMI filter (`arm64-server` vs `amd64-server`). All hardening
-controls, sysctl settings, service masking, audit rules, and AMI scrub steps are
-identical across both architectures.
+Both architectures are built from **the same hardening and environment scripts**:
+`install-cuda.sh`, `harden.sh`, `tune-pro.sh`, `tune-gpu.sh`, `build-base-envs.sh`,
+`build-gpu-envs.sh`, `smoke-gpu.sh`, and `ami-finalize.sh`. The build-time
+differences are the AWS CLI download URL (`aarch64` vs `x86_64`), the Ubuntu source
+AMI filter (`arm64-server` vs `amd64-server`), the CUDA repo arch (`sbsa` vs
+`x86_64`), and TensorFlow GPU vs CPU (x86 vs ARM64). All hardening controls, sysctl
+settings, service masking, audit rules, and AMI scrub steps are identical across
+both architectures.
+
+---
+
+## GPU Driver / Hardening Ordering
+
+The GPU stack is installed **before** CIS hardening, by design:
+
+- `install-cuda.sh` runs after the kernel-upgrade reboot (so the NVIDIA DKMS
+  module builds against the final running kernel) and **before** `harden.sh`, so
+  CIS module/sysctl lockdown never interferes with driver module loading.
+- `nouveau` (the open-source driver) is blacklisted via
+  `/etc/modprobe.d/blacklist-nouveau.conf`; the build reboots once more so nouveau
+  unloads and the proprietary `nvidia` module binds the GPU.
+- The `nvidia`, `nvidia_uvm`, `nvidia_modeset`, and `nvidia_drm` modules load at
+  boot via `/etc/modules-load.d/nvidia.conf`.
+- The driver and toolkit are `apt-mark hold`-ed so `unattended-upgrades` cannot
+  bump them out of lockstep with the CUDA/PyTorch chain.
+- The build verifies `nvidia-smi` both immediately after the driver reboot **and**
+  again after `harden.sh`, confirming hardening did not disturb the GPU.
+
+- Verify on a running instance:
+  ```
+  nvidia-smi
+  lsmod | grep -E 'nvidia|nouveau'   # expect nvidia loaded, nouveau absent
+  apt-mark showhold                   # expect cuda-drivers-570, cuda-toolkit-12-8
+  ```
 
 ---
 
@@ -203,6 +232,11 @@ prevents loading even with `modprobe`.
 | `cramfs`, `freevxfs`, `jffs2`, `hfs`, `hfsplus`, `squashfs`, `udf` | Unused filesystems |
 | `dccp`, `sctp`, `rds`, `tipc` | Unused protocols |
 | `algif_aead` | **CVE-2026-31431** local privilege escalation via AF_ALG socket |
+| `nouveau` | Open-source NVIDIA driver — blacklisted so the proprietary `nvidia` driver binds the GPU (`/etc/modprobe.d/blacklist-nouveau.conf`) |
+
+> The `nvidia`/`nvidia_uvm`/`nvidia_modeset`/`nvidia_drm` modules are **not**
+> blacklisted — they are explicitly loaded at boot. `harden.sh`'s CIS blacklist
+> touches only the modules above.
 
 - Verify:
   ```

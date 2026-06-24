@@ -1,7 +1,7 @@
 # Export Administration Regulations (EAR) Self-Classification Record
 
 ## Product
-CPU DS/ML AMI (Base and Pro variants) — AWS Marketplace
+GPU DS/ML AMI (Base and Pro variants, x86_64 and ARM64) — AWS Marketplace
 
 ## ECCN Determination
 
@@ -87,6 +87,7 @@ In AWS Marketplace Seller Central:
 | Date | Action | By |
 |---|---|---|
 | 2026-05-17 | Initial self-classification, ECCN 5D002.c.1, ENC exception | bgajjela |
+| 2026-06-24 | GPU variant (NVIDIA driver + CUDA 12.8) — classification unchanged; CUDA/cuDNN/driver are not additional cryptographic components | bgajjela |
 
 ---
 

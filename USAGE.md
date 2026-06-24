@@ -1,13 +1,20 @@
-# CPU DS/ML AMI — Usage Guide
+# GPU DS/ML AMI — Usage Guide
 
 Everything is pre-installed and pre-configured. No manual `export JAVA_HOME`, no Nix
 profile sourcing, no PATH changes — just run the commands below.
+
+NVIDIA driver + CUDA 12.8 are installed on **both** base and pro AMIs. The pro AMI
+adds GPU-enabled PyTorch (and GPU TensorFlow on x86; CPU TensorFlow on ARM64).
 
 ---
 
 ## Quick Start
 
 ```bash
+# GPU
+nvidia-smi        # driver + GPU status
+nvcc --version    # CUDA 12.8 toolkit
+
 # Python versions
 py311 -V          # Python 3.11 (base env)
 py312 -V          # Python 3.12 (base env)
@@ -45,10 +52,10 @@ py312 -c "import numpy, pandas, sklearn; print('ok')"
 py313 -c "import numpy, pandas, sklearn; print('ok')"
 ```
 
-### Pro AMI — adds full DL stack
+### Pro AMI — adds full GPU DL stack
 
-Pro environments layer PyTorch, TensorFlow, Transformers, XGBoost, and LightGBM
-on top of the base environments (CPU wheels, no GPU required).
+Pro environments layer **CUDA PyTorch** (`cu128` wheels), TensorFlow, Transformers,
+XGBoost, and LightGBM on top of the base environments.
 
 | Command | Python | Environment path |
 |---------|--------|-----------------|
@@ -57,9 +64,18 @@ on top of the base environments (CPU wheels, no GPU required).
 | `py313` | 3.13   | `/opt/nix/envs/pro-py313` |
 
 ```bash
-py311 -c "import torch; print(torch.__version__)"
-py312 -c "import tensorflow as tf; print(tf.__version__)"
+# Confirm PyTorch sees the GPU (both x86 and ARM64)
+py311 -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+py312 -c "import torch; print(torch.cuda.is_available())"
 py313 -c "from transformers import AutoTokenizer; print('ok')"
+```
+
+**TensorFlow:** GPU-enabled on x86_64 (`tensorflow[and-cuda]`); CPU-only on
+ARM64/Graviton — there is no official aarch64 TensorFlow GPU wheel.
+
+```bash
+# x86: expect a non-empty GPU list; ARM64: expect [] (CPU TensorFlow)
+py311 -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
 ```
 
 ---
@@ -291,7 +307,21 @@ If not: `export PATH="/usr/local/bin:$PATH"` and add it to `~/.bashrc`.
 
 **`import torch` fails on Base AMI**
 PyTorch, TensorFlow, and Transformers are only in the Pro AMI. Check which AMI
-you launched: `cat /usr/share/BUILD_INFO`.
+you launched: `cat /usr/share/BUILD_INFO/version`.
+
+**`torch.cuda.is_available()` returns `False`**
+Confirm the driver is up: `nvidia-smi`. If it errors, the instance may not be a
+GPU type — launch on `g4dn.xlarge` (x86) or `g5g.xlarge` (ARM64) or larger. The
+nvidia modules load at boot via `/etc/modules-load.d/nvidia.conf`.
+
+**`nvidia-smi: command not found` or driver/library version mismatch**
+The driver is `apt-mark hold`-ed to stay in lockstep with CUDA 12.8. Do not
+`apt upgrade` the `cuda-drivers-570` / `cuda-toolkit-12-8` packages — that breaks
+the driver↔CUDA↔PyTorch chain. To change versions, rebuild from `gpu/versions.env`.
+
+**TensorFlow shows no GPU on ARM64**
+Expected — aarch64 TensorFlow is CPU-only (no official GPU wheel). Use PyTorch for
+GPU work on Graviton, or run the x86 pro AMI for GPU TensorFlow.
 
 **`pip install` fails with permission error**
 The Nix environments are system-owned. Use `newenv` to create a personal venv:
